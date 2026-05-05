@@ -1,10 +1,16 @@
 import 'dart:convert';
+import 'dart:io';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:intl/intl.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_stripe/flutter_stripe.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+
+import 'public_profile_screen.dart';
 
 // --- THEME CONSTANTS ---
 const Color kPremiumRed = Color(0xFFD32F2F);
@@ -36,11 +42,22 @@ class _ChatScreenState extends State<ChatScreen> {
   late final Stream<List<Map<String, dynamic>>> _messagesStream;
   late final Stream<List<Map<String, dynamic>>> _chatStream;
 
+  // --- MESSAGE FREEZE CACHE ---
+  List<Map<String, dynamic>> _cachedMessages = [];
+
   String? _askingPrice;
   Key _sliderKey = UniqueKey();
   String? _localPaymentStatus;
 
   bool _isProcessingAction = false;
+
+  late final RealtimeChannel _typingChannel;
+  bool _isOtherUserTyping = false;
+  Timer? _typingTimer;
+
+  // --- BLOCK LOGIC STATE ---
+  bool _isBlockedByMe = false;
+  String? _checkedOtherUserId;
 
   @override
   void initState() {
@@ -58,20 +75,39 @@ class _ChatScreenState extends State<ChatScreen> {
         .eq('id', widget.chatId);
 
     _markMessagesAsRead();
-    _fetchAskingPrice();
+    _fetchChatDetails();
+    _setupTypingIndicator();
   }
 
-  Future<void> _fetchAskingPrice() async {
+  @override
+  void dispose() {
+    _typingTimer?.cancel();
+    Supabase.instance.client.removeChannel(_typingChannel);
+    _messageController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _fetchChatDetails() async {
     try {
       final chatData =
           await Supabase.instance.client
               .from('chats')
-              .select('listing_id, request_id')
+              .select('listing_id, request_id, buyer_id, seller_id')
               .eq('id', widget.chatId)
               .single();
 
-      String? fetchedPrice;
+      final otherUserId =
+          chatData['buyer_id'] == _currentUserId
+              ? chatData['seller_id']
+              : chatData['buyer_id'];
 
+      final blockData = await Supabase.instance.client
+          .from('blocks')
+          .select('id')
+          .eq('blocker_id', _currentUserId)
+          .eq('blocked_id', otherUserId);
+
+      String? fetchedPrice;
       if (chatData['listing_id'] != null) {
         final listingData =
             await Supabase.instance.client
@@ -90,13 +126,108 @@ class _ChatScreenState extends State<ChatScreen> {
         fetchedPrice = requestData['budget'].toString();
       }
 
-      if (mounted && fetchedPrice != null) {
+      if (mounted) {
         setState(() {
-          _askingPrice = fetchedPrice;
+          _isBlockedByMe = blockData.isNotEmpty;
+          _checkedOtherUserId = otherUserId;
+          if (fetchedPrice != null) _askingPrice = fetchedPrice;
         });
       }
     } catch (e) {
-      debugPrint('Error fetching asking price: $e');
+      debugPrint('Error fetching chat details: $e');
+    }
+  }
+
+  Future<void> _checkBlockStatus(String otherId) async {
+    if (_checkedOtherUserId == otherId) return;
+    _checkedOtherUserId = otherId;
+
+    try {
+      final blockData = await Supabase.instance.client
+          .from('blocks')
+          .select('id')
+          .eq('blocker_id', _currentUserId)
+          .eq('blocked_id', otherId);
+
+      if (mounted) {
+        setState(() {
+          _isBlockedByMe = blockData.isNotEmpty;
+        });
+      }
+    } catch (e) {
+      debugPrint('Error checking block status: $e');
+    }
+  }
+
+  void _setupTypingIndicator() {
+    _typingChannel = Supabase.instance.client.channel('chat_${widget.chatId}');
+
+    _typingChannel
+        .onBroadcast(
+          event: 'typing',
+          callback: (payload) {
+            if (payload['sender_id'] != _currentUserId && !_isBlockedByMe) {
+              setState(() => _isOtherUserTyping = true);
+
+              _typingTimer?.cancel();
+              _typingTimer = Timer(const Duration(seconds: 2), () {
+                if (mounted) setState(() => _isOtherUserTyping = false);
+              });
+            }
+          },
+        )
+        .subscribe();
+  }
+
+  void _onTextChanged(String text) {
+    if (_isBlockedByMe) return;
+    _typingChannel.sendBroadcastMessage(
+      event: 'typing',
+      payload: {'sender_id': _currentUserId},
+    );
+  }
+
+  Future<void> _sendImage() async {
+    final picker = ImagePicker();
+    final XFile? image = await picker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 70,
+    );
+
+    if (image == null) return;
+    setState(() => _isProcessingAction = true);
+
+    try {
+      final file = File(image.path);
+      final fileExt = image.path.split('.').last;
+      final fileName = '${DateTime.now().millisecondsSinceEpoch}.$fileExt';
+      final filePath = '${widget.chatId}/$fileName';
+
+      await Supabase.instance.client.storage
+          .from('chat_images')
+          .upload(filePath, file);
+
+      final imageUrl = Supabase.instance.client.storage
+          .from('chat_images')
+          .getPublicUrl(filePath);
+
+      await Supabase.instance.client.from('messages').insert({
+        'chat_id': widget.chatId,
+        'sender_id': _currentUserId,
+        'content': '📷 Image',
+        'image_url': imageUrl,
+      });
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to upload image: $e'),
+            backgroundColor: kPremiumRed,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessingAction = false);
     }
   }
 
@@ -111,8 +242,8 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _sendMessage() async {
-    final text = _messageController.text.trim();
+  Future<void> _sendMessage([String? customText]) async {
+    final text = customText ?? _messageController.text.trim();
     if (text.isEmpty) return;
 
     _messageController.clear();
@@ -135,16 +266,356 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  void _showMeetupSelector() {
+    final List<String> campusSpots = [
+      'Campus Library',
+      'Student Center',
+      'Main Gate',
+      'Cafeteria',
+      'Dorms Lobby',
+    ];
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                margin: const EdgeInsets.only(top: 12, bottom: 8),
+                height: 4,
+                width: 40,
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const Padding(
+                padding: EdgeInsets.all(20),
+                child: Text(
+                  'Suggest a Meetup Spot',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: kTextPrimary,
+                  ),
+                ),
+              ),
+              ...campusSpots.map(
+                (spot) => ListTile(
+                  leading: const Icon(
+                    Icons.location_on_rounded,
+                    color: kPremiumRed,
+                  ),
+                  title: Text(
+                    spot,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _sendMessage("📍 Let's meet at the $spot.");
+                  },
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _showTrustAndSafetyOptions(String otherUserId) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                margin: const EdgeInsets.only(top: 12, bottom: 8),
+                height: 4,
+                width: 40,
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              ListTile(
+                leading: Icon(
+                  _isBlockedByMe
+                      ? Icons.lock_open_rounded
+                      : Icons.block_rounded,
+                  color: Colors.orange,
+                ),
+                title: Text(
+                  _isBlockedByMe ? 'Unblock User' : 'Block User',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  _toggleBlockUser(otherUserId);
+                },
+              ),
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(Icons.flag_rounded, color: kPremiumRed),
+                title: const Text(
+                  'Report User',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: kPremiumRed,
+                  ),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showReportDialog(otherUserId);
+                },
+              ),
+              const SizedBox(height: 16),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _toggleBlockUser(String otherUserId) async {
+    setState(() => _isProcessingAction = true);
+    try {
+      if (_isBlockedByMe) {
+        await Supabase.instance.client
+            .from('blocks')
+            .delete()
+            .eq('blocker_id', _currentUserId)
+            .eq('blocked_id', otherUserId);
+
+        if (mounted) {
+          setState(() => _isBlockedByMe = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('User has been unblocked.'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        }
+      } else {
+        await Supabase.instance.client.from('blocks').insert({
+          'blocker_id': _currentUserId,
+          'blocked_id': otherUserId,
+        });
+
+        if (mounted) {
+          setState(() {
+            _isBlockedByMe = true;
+            _isOtherUserTyping = false;
+          });
+          Navigator.pop(context);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('User has been blocked. Chat removed.'),
+              backgroundColor: Colors.orange,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed: $e'), backgroundColor: kPremiumRed),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessingAction = false);
+    }
+  }
+
+  void _showReportDialog(String otherUserId) {
+    final List<String> reasons = [
+      'Spam or Scam',
+      'Inappropriate Behavior',
+      'No Show',
+      'Fake Listing',
+      'Other',
+    ];
+    String selectedReason = reasons.first;
+    final TextEditingController otherReasonController = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              backgroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+              title: const Text(
+                'Report User',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Why are you reporting this user?',
+                    style: TextStyle(color: kTextSecondary),
+                  ),
+                  const SizedBox(height: 16),
+                  DropdownButtonFormField<String>(
+                    value: selectedReason,
+                    isExpanded: true,
+                    decoration: InputDecoration(
+                      filled: true,
+                      fillColor: kBackground,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                    items:
+                        reasons
+                            .map(
+                              (r) => DropdownMenuItem(value: r, child: Text(r)),
+                            )
+                            .toList(),
+                    onChanged: (val) {
+                      if (val != null) {
+                        setDialogState(() => selectedReason = val);
+                      }
+                    },
+                  ),
+                  if (selectedReason == 'Other') ...[
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: otherReasonController,
+                      textCapitalization: TextCapitalization.sentences,
+                      decoration: InputDecoration(
+                        hintText: 'Please specify the reason...',
+                        filled: true,
+                        fillColor: kBackground,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                      maxLines: 3,
+                    ),
+                  ],
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text(
+                    'Cancel',
+                    style: TextStyle(color: kTextSecondary),
+                  ),
+                ),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: kPremiumRed,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () async {
+                    Navigator.pop(context);
+
+                    final finalReason =
+                        selectedReason == 'Other'
+                            ? 'Other: ${otherReasonController.text.trim()}'
+                            : selectedReason;
+
+                    try {
+                      await Supabase.instance.client.from('reports').insert({
+                        'reporter_id': _currentUserId,
+                        'reported_id': otherUserId,
+                        'reason': finalReason,
+                      });
+
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text(
+                              'Report submitted. Our team will review it shortly.',
+                            ),
+                            backgroundColor: Colors.green,
+                          ),
+                        );
+                      }
+                    } catch (e) {
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text('Failed to send report: $e'),
+                            backgroundColor: kPremiumRed,
+                          ),
+                        );
+                      }
+                    }
+                  },
+                  child: const Text(
+                    'Submit Report',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _showImageFullScreen(String imageUrl) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder:
+            (_) => Scaffold(
+              backgroundColor: Colors.black,
+              appBar: AppBar(
+                backgroundColor: Colors.black,
+                iconTheme: const IconThemeData(color: Colors.white),
+                elevation: 0,
+              ),
+              body: Center(
+                child: InteractiveViewer(
+                  minScale: 0.5,
+                  maxScale: 4.0,
+                  child: CachedNetworkImage(
+                    imageUrl: imageUrl,
+                    fit: BoxFit.contain,
+                    width: double.infinity,
+                    height: double.infinity,
+                  ),
+                ),
+              ),
+            ),
+      ),
+    );
+  }
+
   Future<void> _updateOfferStatus(String messageId, String status) async {
     try {
       await Supabase.instance.client
           .from('messages')
           .update({'offer_status': status})
           .eq('id', messageId);
-
       final statusText =
           status == 'accepted' ? 'accepted the offer!' : 'declined the offer.';
-
       await Supabase.instance.client.from('messages').insert({
         'chat_id': widget.chatId,
         'sender_id': _currentUserId,
@@ -154,14 +625,13 @@ class _ChatScreenState extends State<ChatScreen> {
       if (mounted) {
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(SnackBar(content: Text('Error updating offer: $e')));
+        ).showSnackBar(SnackBar(content: Text('Error: $e')));
       }
     }
   }
 
   void _showInChatOfferDialog() {
     final TextEditingController offerController = TextEditingController();
-
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -188,7 +658,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     'Make an Offer',
                     style: TextStyle(
                       fontSize: 20,
-                      fontWeight: FontWeight.w800,
+                      fontWeight: FontWeight.bold,
                       color: kTextPrimary,
                     ),
                   ),
@@ -204,7 +674,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 style: const TextStyle(
                   color: kTextPrimary,
                   fontSize: 14,
-                  fontWeight: FontWeight.w600,
+                  fontWeight: FontWeight.bold,
                 ),
               ),
               if (_askingPrice != null) ...[
@@ -290,6 +760,7 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  // --- RESTORED ORIGINAL STRIPE LOGIC ---
   Future<void> _payWithStripe(String amountString) async {
     if (_isProcessingAction) return;
     setState(() => _isProcessingAction = true);
@@ -332,7 +803,7 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       );
 
-      if (mounted) Navigator.pop(context); // Close spinner
+      if (mounted) Navigator.pop(context);
 
       await Stripe.instance.presentPaymentSheet();
 
@@ -344,21 +815,111 @@ class _ChatScreenState extends State<ChatScreen> {
       await Supabase.instance.client.from('messages').insert({
         'chat_id': widget.chatId,
         'sender_id': _currentUserId,
-        'content':
-            '💳 Payment of AED $amountString secured in Escrow. Funds are locked and safe.',
+        'content': '💳 Payment of AED $amountString secured in Escrow.',
       });
 
-      if (mounted) {
-        setState(() {
-          _localPaymentStatus = 'paid';
-        });
-      }
+      if (mounted) setState(() => _localPaymentStatus = 'paid');
     } catch (e) {
       if (mounted) {
         if (Navigator.canPop(context)) Navigator.pop(context);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Payment Canceled/Failed: $e'),
+            content: Text('Payment Failed: $e'),
+            backgroundColor: kPremiumRed,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessingAction = false);
+    }
+  }
+
+  Future<void> _updateRentalStatus(String rentalId, String newStatus) async {
+    if (_isProcessingAction) return;
+    setState(() => _isProcessingAction = true);
+    try {
+      await Supabase.instance.client
+          .from('rentals')
+          .update({'status': newStatus})
+          .eq('id', rentalId);
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Updated!')));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed: $e'), backgroundColor: kPremiumRed),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessingAction = false);
+    }
+  }
+
+  Future<void> _payForRental(Map<String, dynamic> rental) async {
+    if (_isProcessingAction) return;
+    setState(() => _isProcessingAction = true);
+    try {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder:
+            (_) => const PopScope(
+              canPop: false,
+              child: Center(
+                child: CircularProgressIndicator(color: Colors.white),
+              ),
+            ),
+      );
+      final double rentCost = (rental['total_rental_cost'] as num).toDouble();
+      final double deposit = (rental['security_deposit'] as num).toDouble();
+      final int amountInFils = ((rentCost + deposit) * 100).toInt();
+
+      final response = await http.post(
+        Uri.parse('https://api.stripe.com/v1/payment_intents'),
+        headers: {
+          'Authorization': 'Bearer ${dotenv.env['STRIPE_SECRET_KEY']}',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: {'amount': amountInFils.toString(), 'currency': 'aed'},
+      );
+      final paymentIntent = jsonDecode(response.body);
+      if (paymentIntent['error'] != null) {
+        throw Exception(paymentIntent['error']['message']);
+      }
+      final String paymentIntentId =
+          paymentIntent['id'] ?? paymentIntent['paymentIntentId'];
+
+      await Stripe.instance.initPaymentSheet(
+        paymentSheetParameters: SetupPaymentSheetParameters(
+          paymentIntentClientSecret: paymentIntent['client_secret'],
+          merchantDisplayName: 'Avory Campus Market',
+          style: ThemeMode.system,
+        ),
+      );
+      if (mounted) Navigator.pop(context);
+      await Stripe.instance.presentPaymentSheet();
+      await Supabase.instance.client
+          .from('rentals')
+          .update({
+            'status': 'active',
+            'payment_status': 'paid',
+            'stripe_payment_intent_id': paymentIntentId,
+          })
+          .eq('id', rental['id']);
+      await Supabase.instance.client.from('messages').insert({
+        'chat_id': widget.chatId,
+        'sender_id': _currentUserId,
+        'content': '💳 Rental Payment successful!',
+      });
+    } catch (e) {
+      if (mounted) {
+        if (Navigator.canPop(context)) Navigator.pop(context);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Payment Failed: $e'),
             backgroundColor: kPremiumRed,
           ),
         );
@@ -371,48 +932,37 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _cancelTrade() async {
     if (_isProcessingAction) return;
     setState(() => _isProcessingAction = true);
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder:
-          (_) => const PopScope(
-            canPop: false,
-            child: Center(
-              child: CircularProgressIndicator(color: Colors.white),
-            ),
-          ),
-    );
-
     try {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder:
+            (_) => const PopScope(
+              canPop: false,
+              child: Center(
+                child: CircularProgressIndicator(color: Colors.white),
+              ),
+            ),
+      );
       final verify =
           await Supabase.instance.client
               .from('chats')
               .select('payment_status')
               .eq('id', widget.chatId)
               .single();
-
       if (verify['payment_status'] != 'paid') {
-        throw Exception('Action failed: Trade is no longer in escrow.');
+        throw Exception('Trade is no longer in escrow.');
       }
-
       await Supabase.instance.client
           .from('chats')
           .update({'payment_status': 'cancelled'})
           .eq('id', widget.chatId);
-
       await Supabase.instance.client.from('messages').insert({
         'chat_id': widget.chatId,
         'sender_id': _currentUserId,
-        'content':
-            '⚠️ Trade Cancelled. The funds have been refunded to the buyer.',
+        'content': '⚠️ Trade Cancelled. Funds refunded.',
       });
-
-      if (mounted) {
-        setState(() {
-          _localPaymentStatus = 'cancelled';
-        });
-      }
+      if (mounted) setState(() => _localPaymentStatus = 'cancelled');
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -431,43 +981,38 @@ class _ChatScreenState extends State<ChatScreen> {
     String? listingId,
     String? requestId,
     String sellerId,
+    String? finalPrice,
   ) async {
     if (_isProcessingAction) return;
     setState(() => _isProcessingAction = true);
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder:
-          (_) => const PopScope(
-            canPop: false,
-            child: Center(
-              child: CircularProgressIndicator(color: Colors.white),
-            ),
-          ),
-    );
-
     try {
-      final verify =
-          await Supabase.instance.client
-              .from('chats')
-              .select('payment_status')
-              .eq('id', widget.chatId)
-              .single();
-
-      if (verify['payment_status'] != 'paid') {
-        throw Exception('Action failed: Trade is no longer in escrow.');
-      }
-
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder:
+            (_) => const PopScope(
+              canPop: false,
+              child: Center(
+                child: CircularProgressIndicator(color: Colors.white),
+              ),
+            ),
+      );
       await Supabase.instance.client
           .from('chats')
           .update({'payment_status': 'completed'})
           .eq('id', widget.chatId);
-
       if (listingId != null) {
+        final updateData = <String, dynamic>{
+          'is_sold': true,
+          'buyer_id': _currentUserId,
+        };
+        if (finalPrice != null && finalPrice != '0') {
+          updateData['price'] =
+              double.tryParse(finalPrice) ?? updateData['price'];
+        }
         await Supabase.instance.client
             .from('listings')
-            .update({'is_sold': true, 'buyer_id': _currentUserId})
+            .update(updateData)
             .eq('id', listingId);
       } else if (requestId != null) {
         await Supabase.instance.client
@@ -475,13 +1020,11 @@ class _ChatScreenState extends State<ChatScreen> {
             .update({'is_fulfilled': true})
             .eq('id', requestId);
       }
-
       await Supabase.instance.client.from('messages').insert({
         'chat_id': widget.chatId,
         'sender_id': _currentUserId,
-        'content': '✅ Trade Completed! Funds have been released to the seller.',
+        'content': '✅ Trade Completed! Funds released.',
       });
-
       if (mounted) {
         setState(() {
           _localPaymentStatus = 'completed';
@@ -498,9 +1041,67 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       }
     } finally {
-      if (mounted) {
-        setState(() => _isProcessingAction = false);
+      if (mounted) setState(() => _isProcessingAction = false);
+    }
+  }
+
+  Future<void> _completeRentalAndRefund(Map<String, dynamic> rental) async {
+    if (_isProcessingAction) return;
+    setState(() => _isProcessingAction = true);
+    try {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder:
+            (_) => const PopScope(
+              canPop: false,
+              child: Center(
+                child: CircularProgressIndicator(color: Colors.white),
+              ),
+            ),
+      );
+      final response = await http.post(
+        Uri.parse('https://api.stripe.com/v1/refunds'),
+        headers: {
+          'Authorization': 'Bearer ${dotenv.env['STRIPE_SECRET_KEY']}',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: {
+          'payment_intent': rental['stripe_payment_intent_id'],
+          'amount':
+              ((rental['security_deposit'] as num).toDouble() * 100)
+                  .toInt()
+                  .toString(),
+        },
+      );
+
+      final refundData = jsonDecode(response.body);
+      if (refundData['error'] != null) {
+        throw Exception(refundData['error']['message']);
       }
+
+      await Supabase.instance.client
+          .from('rentals')
+          .update({'status': 'completed'})
+          .eq('id', rental['id']);
+      await Supabase.instance.client.from('messages').insert({
+        'chat_id': widget.chatId,
+        'sender_id': _currentUserId,
+        'content': '✅ Item returned safely! Deposit released.',
+      });
+      if (mounted) {
+        Navigator.pop(context);
+        _showReviewModal(rental['renter_id'], rental['listing_id'], null);
+      }
+    } catch (e) {
+      if (mounted) {
+        Navigator.pop(context);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: $e'), backgroundColor: kPremiumRed),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessingAction = false);
     }
   }
 
@@ -511,55 +1112,36 @@ class _ChatScreenState extends State<ChatScreen> {
   ) {
     int rating = 5;
     final commentController = TextEditingController();
-
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: Colors.transparent,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
       builder: (context) {
         return StatefulBuilder(
           builder: (context, setModalState) {
-            return Container(
+            return Padding(
               padding: EdgeInsets.only(
                 bottom: MediaQuery.of(context).viewInsets.bottom + 24,
                 top: 24,
                 left: 24,
                 right: 24,
               ),
-              decoration: const BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-              ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(
-                    Icons.celebration_rounded,
-                    color: Colors.orangeAccent,
-                    size: 48,
-                  ),
-                  const SizedBox(height: 12),
                   const Text(
                     'Trade Complete!',
-                    style: TextStyle(
-                      fontSize: 22,
-                      fontWeight: FontWeight.w900,
-                      color: kTextPrimary,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'How was your experience with the seller?',
-                    style: TextStyle(
-                      color: kTextSecondary,
-                      fontWeight: FontWeight.w500,
-                    ),
+                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 24),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.center,
-                    children: List.generate(5, (index) {
-                      return IconButton(
+                    children: List.generate(
+                      5,
+                      (index) => IconButton(
                         icon: Icon(
                           index < rating
                               ? Icons.star_rounded
@@ -567,71 +1149,31 @@ class _ChatScreenState extends State<ChatScreen> {
                           color: Colors.amber,
                           size: 40,
                         ),
-                        onPressed: () {
-                          setModalState(() => rating = index + 1);
-                        },
-                      );
-                    }),
+                        onPressed:
+                            () => setModalState(() => rating = index + 1),
+                      ),
+                    ),
                   ),
                   const SizedBox(height: 16),
                   TextField(
                     controller: commentController,
-                    textCapitalization: TextCapitalization.sentences,
-                    decoration: InputDecoration(
-                      hintText: 'Leave a quick comment...',
-                      filled: true,
-                      fillColor: kBackground,
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(16),
-                        borderSide: BorderSide.none,
-                      ),
+                    decoration: const InputDecoration(
+                      hintText: 'Leave a comment...',
                     ),
-                    maxLines: 3,
                   ),
                   const SizedBox(height: 24),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.green,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(vertical: 16),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16),
-                        ),
-                      ),
-                      onPressed: () async {
-                        Navigator.pop(context);
-                        try {
-                          await Supabase.instance.client
-                              .from('reviews')
-                              .insert({
-                                'listing_id': listingId,
-                                'buyer_id': _currentUserId,
-                                'seller_id': revieweeId,
-                                'rating': rating,
-                                'comment': commentController.text,
-                              });
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Review published!'),
-                                backgroundColor: Colors.green,
-                              ),
-                            );
-                          }
-                        } catch (e) {
-                          debugPrint('Error saving review: $e');
-                        }
-                      },
-                      child: const Text(
-                        'Publish Review',
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 16,
-                        ),
-                      ),
-                    ),
+                  ElevatedButton(
+                    onPressed: () async {
+                      Navigator.pop(context);
+                      await Supabase.instance.client.from('reviews').insert({
+                        'listing_id': listingId,
+                        'buyer_id': _currentUserId,
+                        'seller_id': revieweeId,
+                        'rating': rating,
+                        'comment': commentController.text,
+                      });
+                    },
+                    child: const Text('Publish Review'),
                   ),
                 ],
               ),
@@ -659,24 +1201,22 @@ class _ChatScreenState extends State<ChatScreen> {
 
           final paymentStatus =
               _localPaymentStatus ?? chatRow['payment_status'] ?? 'pending';
-
           final listingId = chatRow['listing_id'];
           final requestId = chatRow['request_id'];
 
-          final bool isCurrentUserBuyer;
-          final String trueSellerId;
-
-          if (requestId != null) {
-            isCurrentUserBuyer = _currentUserId != chatRow['buyer_id'];
-            trueSellerId = chatRow['buyer_id'];
-          } else {
-            isCurrentUserBuyer = _currentUserId == chatRow['buyer_id'];
-            trueSellerId = chatRow['seller_id'];
-          }
+          final bool isCurrentUserBuyer = _currentUserId == chatRow['buyer_id'];
+          final String trueSellerId = chatRow['seller_id'];
+          final String otherUserId =
+              isCurrentUserBuyer ? chatRow['seller_id'] : chatRow['buyer_id'];
 
           final otherUserRole = isCurrentUserBuyer ? 'Seller' : 'Buyer';
           final roleColor =
               isCurrentUserBuyer ? Colors.deepPurple : Colors.teal;
+
+          final bool isChatLocked =
+              paymentStatus == 'completed' || paymentStatus == 'cancelled';
+
+          _checkBlockStatus(otherUserId);
 
           return Column(
             children: [
@@ -687,67 +1227,86 @@ class _ChatScreenState extends State<ChatScreen> {
                 shadowColor: Colors.black.withOpacity(0.1),
                 iconTheme: const IconThemeData(color: kTextPrimary),
                 titleSpacing: 0,
-                title: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Text(
-                          widget.otherUserName,
-                          style: const TextStyle(
-                            color: kTextPrimary,
-                            fontWeight: FontWeight.w800,
-                            fontSize: 18,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 5,
-                          ),
-                          decoration: BoxDecoration(
-                            color: roleColor.withOpacity(0.1),
-                            borderRadius: BorderRadius.circular(6),
-                            border: Border.all(
-                              color: roleColor.withOpacity(0.5),
-                              width: 1.0,
+                actions: [
+                  IconButton(
+                    icon: const Icon(Icons.more_vert_rounded),
+                    onPressed: () => _showTrustAndSafetyOptions(otherUserId),
+                  ),
+                ],
+                title: GestureDetector(
+                  onTap: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder:
+                            (context) => PublicProfileScreen(
+                              sellerId: otherUserId,
+                              sellerName: widget.otherUserName,
+                            ),
+                      ),
+                    );
+                  },
+                  behavior: HitTestBehavior.opaque,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Text(
+                            widget.otherUserName,
+                            style: const TextStyle(
+                              color: kTextPrimary,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 18,
                             ),
                           ),
-                          child: Text(
-                            otherUserRole.toUpperCase(),
-                            style: TextStyle(
-                              color: roleColor,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w700,
-                              letterSpacing: 0.8,
+                          const SizedBox(width: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 5,
+                            ),
+                            decoration: BoxDecoration(
+                              color: roleColor.withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(
+                                color: roleColor.withOpacity(0.5),
+                                width: 1.0,
+                              ),
+                            ),
+                            child: Text(
+                              otherUserRole.toUpperCase(),
+                              style: TextStyle(
+                                color: roleColor,
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
                             ),
                           ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 2),
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.shopping_bag_outlined,
-                          size: 12,
-                          color: kTextSecondary,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          _askingPrice != null
-                              ? '${widget.itemTitle} • AED $_askingPrice'
-                              : widget.itemTitle,
-                          style: const TextStyle(
+                        ],
+                      ),
+                      const SizedBox(height: 2),
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.shopping_bag_outlined,
+                            size: 12,
                             color: kTextSecondary,
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600,
                           ),
-                        ),
-                      ],
-                    ),
-                  ],
+                          const SizedBox(width: 4),
+                          Text(
+                            _askingPrice != null
+                                ? '${widget.itemTitle} • AED $_askingPrice'
+                                : widget.itemTitle,
+                            style: const TextStyle(
+                              color: kTextSecondary,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
               Expanded(
@@ -761,9 +1320,15 @@ class _ChatScreenState extends State<ChatScreen> {
                       );
                     }
 
-                    final messages = msgSnapshot.data ?? [];
+                    final incomingMessages = msgSnapshot.data ?? [];
+
+                    if (!_isBlockedByMe) {
+                      _cachedMessages = incomingMessages;
+                    }
+                    final messagesToRender = _cachedMessages;
+
                     final unreadMessages =
-                        messages
+                        messagesToRender
                             .where(
                               (msg) =>
                                   msg['is_read'] == false &&
@@ -771,7 +1336,7 @@ class _ChatScreenState extends State<ChatScreen> {
                             )
                             .toList();
 
-                    if (unreadMessages.isNotEmpty) {
+                    if (unreadMessages.isNotEmpty && !_isBlockedByMe) {
                       WidgetsBinding.instance.addPostFrameCallback(
                         (_) => _markMessagesAsRead(),
                       );
@@ -781,7 +1346,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     String acceptedAmount = '0';
 
                     try {
-                      final acceptedMsg = messages.firstWhere(
+                      final acceptedMsg = messagesToRender.firstWhere(
                         (msg) =>
                             msg['is_offer'] == true &&
                             msg['offer_status'] == 'accepted',
@@ -789,14 +1354,11 @@ class _ChatScreenState extends State<ChatScreen> {
                       hasAcceptedOffer = true;
                       acceptedAmount = acceptedMsg['content'];
                     } catch (e) {
-                      // No accepted offer found, keep false
+                      // Keep false
                     }
 
                     return Column(
                       children: [
-                        // ============================================
-                        // SMART RENTAL BANNER LOGIC
-                        // ============================================
                         if (listingId != null)
                           StreamBuilder<List<Map<String, dynamic>>>(
                             stream: Supabase.instance.client
@@ -879,12 +1441,9 @@ class _ChatScreenState extends State<ChatScreen> {
                             acceptedAmount,
                           ),
 
-                        // ============================================
-                        // MESSAGE LIST
-                        // ============================================
                         Expanded(
                           child:
-                              messages.isEmpty
+                              messagesToRender.isEmpty
                                   ? Center(
                                     child: Column(
                                       mainAxisAlignment:
@@ -915,18 +1474,79 @@ class _ChatScreenState extends State<ChatScreen> {
                                           'Start the conversation!',
                                           style: TextStyle(
                                             color: kTextSecondary,
-                                            fontWeight: FontWeight.w600,
                                           ),
                                         ),
+                                        if (!isChatLocked &&
+                                            !_isBlockedByMe) ...[
+                                          const SizedBox(height: 32),
+                                          Wrap(
+                                            alignment: WrapAlignment.center,
+                                            spacing: 8,
+                                            runSpacing: 8,
+                                            children: [
+                                              ActionChip(
+                                                label: const Text(
+                                                  'Is this still available?',
+                                                ),
+                                                onPressed:
+                                                    () => _sendMessage(
+                                                      'Is this still available?',
+                                                    ),
+                                                backgroundColor: Colors.white,
+                                                shape: RoundedRectangleBorder(
+                                                  borderRadius:
+                                                      BorderRadius.circular(20),
+                                                  side: BorderSide(
+                                                    color: Colors.grey.shade300,
+                                                  ),
+                                                ),
+                                              ),
+                                              ActionChip(
+                                                label: const Text(
+                                                  'What is the condition?',
+                                                ),
+                                                onPressed:
+                                                    () => _sendMessage(
+                                                      'What is the condition?',
+                                                    ),
+                                                backgroundColor: Colors.white,
+                                                shape: RoundedRectangleBorder(
+                                                  borderRadius:
+                                                      BorderRadius.circular(20),
+                                                  side: BorderSide(
+                                                    color: Colors.grey.shade300,
+                                                  ),
+                                                ),
+                                              ),
+                                              ActionChip(
+                                                label: const Text(
+                                                  'Are you negotiable?',
+                                                ),
+                                                onPressed:
+                                                    () => _sendMessage(
+                                                      'Are you negotiable?',
+                                                    ),
+                                                backgroundColor: Colors.white,
+                                                shape: RoundedRectangleBorder(
+                                                  borderRadius:
+                                                      BorderRadius.circular(20),
+                                                  side: BorderSide(
+                                                    color: Colors.grey.shade300,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ],
                                       ],
                                     ),
                                   )
                                   : ListView.builder(
                                     reverse: true,
                                     padding: const EdgeInsets.all(16),
-                                    itemCount: messages.length,
+                                    itemCount: messagesToRender.length,
                                     itemBuilder: (context, index) {
-                                      final message = messages[index];
+                                      final message = messagesToRender[index];
                                       final isMe =
                                           message['sender_id'] ==
                                           _currentUserId;
@@ -941,9 +1561,22 @@ class _ChatScreenState extends State<ChatScreen> {
                                   ),
                         ),
 
-                        // ============================================
-                        // INPUT AREA
-                        // ============================================
+                        if (_isOtherUserTyping && !_isBlockedByMe)
+                          Padding(
+                            padding: const EdgeInsets.only(left: 24, bottom: 8),
+                            child: Align(
+                              alignment: Alignment.centerLeft,
+                              child: Text(
+                                '${widget.otherUserName} is typing...',
+                                style: TextStyle(
+                                  color: Colors.grey.shade500,
+                                  fontSize: 12,
+                                  fontStyle: FontStyle.italic,
+                                ),
+                              ),
+                            ),
+                          ),
+
                         Container(
                           decoration: BoxDecoration(
                             color: Colors.white,
@@ -956,102 +1589,212 @@ class _ChatScreenState extends State<ChatScreen> {
                           ),
                           child: SafeArea(
                             top: false,
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 16,
-                                vertical: 10,
-                              ),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.end,
-                                children: [
-                                  Expanded(
-                                    child: Container(
-                                      constraints: const BoxConstraints(
-                                        minHeight: 50,
-                                        maxHeight: 120,
+                            child:
+                                isChatLocked
+                                    ? Container(
+                                      width: double.infinity,
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 24,
                                       ),
-                                      decoration: BoxDecoration(
-                                        color: kBackground,
-                                        borderRadius: BorderRadius.circular(25),
-                                      ),
-                                      child: TextField(
-                                        controller: _messageController,
-                                        textCapitalization:
-                                            TextCapitalization.sentences,
-                                        cursorColor: kPremiumRed,
-                                        minLines: 1,
-                                        maxLines: 5,
-                                        textAlignVertical:
-                                            TextAlignVertical.center,
-                                        style: const TextStyle(
-                                          color: kTextPrimary,
+                                      color: kBackground,
+                                      child: const Text(
+                                        'This chat is now closed.',
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(
+                                          color: kTextSecondary,
+                                          fontWeight: FontWeight.bold,
                                           fontSize: 16,
                                         ),
-                                        decoration: InputDecoration(
-                                          hintText: 'Message',
-                                          hintStyle: TextStyle(
-                                            color: Colors.grey.shade500,
-                                            fontSize: 16,
+                                      ),
+                                    )
+                                    : _isBlockedByMe
+                                    ? Container(
+                                      width: double.infinity,
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 20,
+                                      ),
+                                      color: kBackground,
+                                      child: Column(
+                                        children: [
+                                          const Text(
+                                            'You blocked this user.',
+                                            style: TextStyle(
+                                              color: kTextSecondary,
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 16,
+                                            ),
                                           ),
-                                          border: InputBorder.none,
-                                          isDense: true,
-                                          contentPadding:
-                                              const EdgeInsets.symmetric(
-                                                horizontal: 20,
-                                                vertical: 14,
+                                          const SizedBox(height: 8),
+                                          GestureDetector(
+                                            onTap:
+                                                () => _toggleBlockUser(
+                                                  otherUserId,
+                                                ),
+                                            child: const Text(
+                                              'Tap to unblock',
+                                              style: TextStyle(
+                                                color: kPremiumRed,
+                                                fontWeight: FontWeight.bold,
                                               ),
-                                        ),
-                                        onSubmitted: (_) => _sendMessage(),
-                                      ),
-                                    ),
-                                  ),
-
-                                  if (isCurrentUserBuyer &&
-                                      !hasAcceptedOffer &&
-                                      paymentStatus == 'pending') ...[
-                                    const SizedBox(width: 12),
-                                    GestureDetector(
-                                      onTap: _showInChatOfferDialog,
-                                      child: Container(
-                                        width: 50,
-                                        height: 50,
-                                        decoration: BoxDecoration(
-                                          color: Colors.amber.shade100,
-                                          shape: BoxShape.circle,
-                                          border: Border.all(
-                                            color: Colors.amber.shade300,
-                                            width: 1.5,
+                                            ),
                                           ),
-                                        ),
-                                        child: Icon(
-                                          Icons.local_offer_rounded,
-                                          color: Colors.amber.shade800,
-                                          size: 22,
-                                        ),
+                                        ],
+                                      ),
+                                    )
+                                    : Padding(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 16,
+                                        vertical: 10,
+                                      ),
+                                      child: Row(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.end,
+                                        children: [
+                                          GestureDetector(
+                                            onTap: _showMeetupSelector,
+                                            child: Container(
+                                              width: 40,
+                                              height: 50,
+                                              margin: const EdgeInsets.only(
+                                                right: 8,
+                                              ),
+                                              decoration: BoxDecoration(
+                                                color: kBackground,
+                                                borderRadius:
+                                                    BorderRadius.circular(20),
+                                              ),
+                                              child: const Icon(
+                                                Icons.location_on_outlined,
+                                                color: kTextSecondary,
+                                                size: 22,
+                                              ),
+                                            ),
+                                          ),
+                                          GestureDetector(
+                                            onTap: _sendImage,
+                                            child: Container(
+                                              width: 40,
+                                              height: 50,
+                                              margin: const EdgeInsets.only(
+                                                right: 12,
+                                              ),
+                                              decoration: BoxDecoration(
+                                                color: kBackground,
+                                                borderRadius:
+                                                    BorderRadius.circular(20),
+                                              ),
+                                              child:
+                                                  _isProcessingAction
+                                                      ? const Padding(
+                                                        padding: EdgeInsets.all(
+                                                          14.0,
+                                                        ),
+                                                        child:
+                                                            CircularProgressIndicator(
+                                                              strokeWidth: 2,
+                                                              color:
+                                                                  kPremiumRed,
+                                                            ),
+                                                      )
+                                                      : const Icon(
+                                                        Icons
+                                                            .add_photo_alternate_outlined,
+                                                        color: kTextSecondary,
+                                                        size: 22,
+                                                      ),
+                                            ),
+                                          ),
+                                          Expanded(
+                                            child: Container(
+                                              constraints: const BoxConstraints(
+                                                minHeight: 50,
+                                                maxHeight: 120,
+                                              ),
+                                              decoration: BoxDecoration(
+                                                color: kBackground,
+                                                borderRadius:
+                                                    BorderRadius.circular(25),
+                                              ),
+                                              child: TextField(
+                                                controller: _messageController,
+                                                onChanged: _onTextChanged,
+                                                textCapitalization:
+                                                    TextCapitalization
+                                                        .sentences,
+                                                cursorColor: kPremiumRed,
+                                                minLines: 1,
+                                                maxLines: 5,
+                                                textAlignVertical:
+                                                    TextAlignVertical.center,
+                                                style: const TextStyle(
+                                                  color: kTextPrimary,
+                                                  fontSize: 16,
+                                                ),
+                                                decoration: InputDecoration(
+                                                  hintText: 'Message',
+                                                  hintStyle: TextStyle(
+                                                    color: Colors.grey.shade500,
+                                                    fontSize: 16,
+                                                  ),
+                                                  border: InputBorder.none,
+                                                  isDense: true,
+                                                  contentPadding:
+                                                      const EdgeInsets.symmetric(
+                                                        horizontal: 20,
+                                                        vertical: 14,
+                                                      ),
+                                                ),
+                                                onSubmitted:
+                                                    (_) => _sendMessage(),
+                                              ),
+                                            ),
+                                          ),
+                                          if (isCurrentUserBuyer &&
+                                              !hasAcceptedOffer &&
+                                              paymentStatus == 'pending') ...[
+                                            const SizedBox(width: 12),
+                                            GestureDetector(
+                                              onTap: _showInChatOfferDialog,
+                                              child: Container(
+                                                width: 50,
+                                                height: 50,
+                                                decoration: BoxDecoration(
+                                                  color: Colors.amber.shade100,
+                                                  shape: BoxShape.circle,
+                                                  border: Border.all(
+                                                    color:
+                                                        Colors.amber.shade300,
+                                                    width: 1.5,
+                                                  ),
+                                                ),
+                                                child: Icon(
+                                                  Icons.local_offer_rounded,
+                                                  color: Colors.amber.shade800,
+                                                  size: 22,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                          const SizedBox(width: 12),
+                                          GestureDetector(
+                                            onTap: _sendMessage,
+                                            child: Container(
+                                              width: 50,
+                                              height: 50,
+                                              decoration: const BoxDecoration(
+                                                color: kPremiumRed,
+                                                shape: BoxShape.circle,
+                                              ),
+                                              child: const Icon(
+                                                Icons.send_rounded,
+                                                color: Colors.white,
+                                                size: 24,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
                                       ),
                                     ),
-                                  ],
-
-                                  const SizedBox(width: 12),
-                                  GestureDetector(
-                                    onTap: _sendMessage,
-                                    child: Container(
-                                      width: 50,
-                                      height: 50,
-                                      decoration: const BoxDecoration(
-                                        color: kPremiumRed,
-                                        shape: BoxShape.circle,
-                                      ),
-                                      child: const Icon(
-                                        Icons.send_rounded,
-                                        color: Colors.white,
-                                        size: 24,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
                           ),
                         ),
                       ],
@@ -1066,13 +1809,13 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  // =====================================================================
-  // RENTAL CONTEXT BANNER
-  // =====================================================================
   Widget _buildRentalContextBanner(Map<String, dynamic> rental, bool isOwner) {
     final String status = rental['status'];
     final DateTime endDate = DateTime.parse(rental['end_date']).toLocal();
     final DateTime now = DateTime.now();
+    final double rentCost = (rental['total_rental_cost'] as num).toDouble();
+    final double deposit = (rental['security_deposit'] as num).toDouble();
+    final double totalAmount = rentCost + deposit;
 
     final endDay = DateTime(endDate.year, endDate.month, endDate.day);
     final today = DateTime(now.year, now.month, now.day);
@@ -1083,6 +1826,7 @@ class _ChatScreenState extends State<ChatScreen> {
     IconData icon;
     String title;
     String subtitle;
+    Widget? actionWidget;
 
     if (status == 'pending') {
       bannerColor = Colors.amber.shade50;
@@ -1091,8 +1835,46 @@ class _ChatScreenState extends State<ChatScreen> {
       title = 'Rental Requested';
       subtitle =
           isOwner
-              ? 'Tap your Activity tab to approve this.'
+              ? 'They want to rent this item.'
               : 'Waiting for the owner to approve.';
+
+      if (isOwner) {
+        actionWidget = Row(
+          children: [
+            Expanded(
+              child: OutlinedButton(
+                onPressed: () => _updateRentalStatus(rental['id'], 'cancelled'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: kTextSecondary,
+                  side: BorderSide(color: Colors.black.withOpacity(0.1)),
+                ),
+                child: const Text('Decline'),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: ElevatedButton(
+                onPressed:
+                    () => _updateRentalStatus(rental['id'], 'awaiting_payment'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: kPremiumRed,
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text('Approve'),
+              ),
+            ),
+          ],
+        );
+      } else {
+        actionWidget = SizedBox(
+          width: double.infinity,
+          child: TextButton(
+            onPressed: () => _updateRentalStatus(rental['id'], 'cancelled'),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Cancel Request'),
+          ),
+        );
+      }
     } else if (status == 'awaiting_payment') {
       bannerColor = Colors.orange.shade50;
       iconColor = Colors.orange.shade800;
@@ -1100,8 +1882,23 @@ class _ChatScreenState extends State<ChatScreen> {
       title = 'Request Approved';
       subtitle =
           isOwner
-              ? 'Waiting for the renter to pay the deposit.'
-              : 'Tap your Activity tab to pay and start the rental!';
+              ? 'Waiting for them to pay AED $totalAmount.'
+              : 'Total due: AED $totalAmount (inc. deposit).';
+
+      if (!isOwner) {
+        actionWidget = SizedBox(
+          width: double.infinity,
+          child: ElevatedButton.icon(
+            onPressed: () => _payForRental(rental),
+            icon: const Icon(Icons.credit_card_rounded),
+            label: const Text('Pay Now to Start Rental'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.green,
+              foregroundColor: Colors.white,
+            ),
+          ),
+        );
+      }
     } else if (status == 'active') {
       if (daysLeft < 0) {
         bannerColor = Colors.red.shade50;
@@ -1122,58 +1919,87 @@ class _ChatScreenState extends State<ChatScreen> {
                 ? 'Due Today (${DateFormat('MMM d').format(endDate)})'
                 : '⏳ $daysLeft Days Left (Due ${DateFormat('MMM d').format(endDate)})';
       }
+
+      if (isOwner) {
+        actionWidget = SizedBox(
+          width: double.infinity,
+          child: ElevatedButton.icon(
+            onPressed: () => _completeRentalAndRefund(rental),
+            icon: const Icon(Icons.verified_rounded),
+            label: const Text('Confirm Return & Refund Deposit'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.deepPurple,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+            ),
+          ),
+        );
+      }
     } else if (status == 'completed') {
       bannerColor = Colors.deepPurple.shade50;
       iconColor = Colors.deepPurple;
       icon = Icons.verified_rounded;
       title = 'Rental Completed';
       subtitle = 'The item was returned and deposit refunded.';
+    } else if (status == 'cancelled') {
+      bannerColor = Colors.red.shade50;
+      iconColor = Colors.red.shade800;
+      icon = Icons.cancel_rounded;
+      title = 'Rental Cancelled';
+      subtitle = 'This request was cancelled.';
     } else {
       return const SizedBox.shrink();
     }
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
       decoration: BoxDecoration(
         color: bannerColor,
         border: Border(bottom: BorderSide(color: iconColor.withOpacity(0.2))),
       ),
-      child: Row(
+      child: Column(
         children: [
-          Icon(icon, color: iconColor, size: 28),
-          const SizedBox(width: 16),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: TextStyle(
-                    color: iconColor,
-                    fontWeight: FontWeight.w900,
-                    fontSize: 15,
-                  ),
+          Row(
+            children: [
+              Icon(icon, color: iconColor, size: 28),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        color: iconColor,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        color: iconColor.withOpacity(0.8),
+                        fontSize: 13,
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  subtitle,
-                  style: TextStyle(
-                    color: iconColor.withOpacity(0.8),
-                    fontWeight: FontWeight.w600,
-                    fontSize: 12,
-                  ),
-                ),
-              ],
-            ),
+              ),
+            ],
           ),
+          if (actionWidget != null) ...[
+            const SizedBox(height: 12),
+            actionWidget,
+          ],
         ],
       ),
     );
   }
 
-  // =====================================================================
-  // EXISTING ESCROW BANNER
-  // =====================================================================
   Widget _buildEscrowBanner(
     String status,
     bool isBuyer,
@@ -1294,7 +2120,12 @@ class _ChatScreenState extends State<ChatScreen> {
               SwipeToReleaseButton(
                 key: _sliderKey,
                 onConfirmed:
-                    () => _releaseFunds(listingId, requestId, trueSellerId),
+                    () => _releaseFunds(
+                      listingId,
+                      requestId,
+                      trueSellerId,
+                      amount,
+                    ),
               ),
               const SizedBox(height: 12),
               Center(
@@ -1341,18 +2172,14 @@ class _ChatScreenState extends State<ChatScreen> {
     return const SizedBox.shrink();
   }
 
-  // =====================================================================
-  // MESSAGE BUBBLES
-  // =====================================================================
-
   Widget _buildMessageBubble(Map<String, dynamic> message, bool isMe) {
     final DateTime createdAt = DateTime.parse(message['created_at']).toLocal();
     final String timeString = DateFormat('h:mm a').format(createdAt);
     final bool isRead = message['is_read'] ?? false;
     final String rawContent = message['content'].toString();
+    final String? imageUrl = message['image_url'];
 
-    // 1. Check if this is the Automated Rental Request Message
-    if (rawContent.startsWith('📅 Rental Request!')) {
+    if (rawContent.startsWith('📅 Rental Request!\n')) {
       return _buildRentalRequestBubble(
         message,
         isMe,
@@ -1362,8 +2189,6 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
 
-    // 2. Check if this is a standard System Message (Receipts, Cancels, etc.)
-    // Note: I removed the 📅 emoji from here so it doesn't trigger the grey pill!
     final bool isSystemMessage =
         rawContent.contains('💳') ||
         rawContent.contains('✅') ||
@@ -1385,7 +2210,7 @@ class _ChatScreenState extends State<ChatScreen> {
               style: const TextStyle(
                 color: kTextSecondary,
                 fontSize: 12,
-                fontWeight: FontWeight.w600,
+                fontWeight: FontWeight.bold,
               ),
             ),
           ),
@@ -1393,7 +2218,6 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
 
-    // 3. Normal Text Message
     return Align(
       alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -1422,14 +2246,43 @@ class _ChatScreenState extends State<ChatScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            Text(
-              rawContent,
-              style: TextStyle(
-                color: isMe ? Colors.white : kTextPrimary,
-                fontSize: 16,
-                height: 1.3,
+            if (imageUrl != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: GestureDetector(
+                  onTap: () => _showImageFullScreen(imageUrl),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: CachedNetworkImage(
+                      imageUrl: imageUrl,
+                      fit: BoxFit.cover,
+                      placeholder:
+                          (context, url) => Container(
+                            height: 150,
+                            width: 200,
+                            color:
+                                isMe
+                                    ? Colors.white.withOpacity(0.2)
+                                    : Colors.grey.shade100,
+                            child: const Center(
+                              child: CircularProgressIndicator(
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                    ),
+                  ),
+                ),
               ),
-            ),
+            if (imageUrl == null || rawContent != '📷 Image')
+              Text(
+                rawContent,
+                style: TextStyle(
+                  color: isMe ? Colors.white : kTextPrimary,
+                  fontSize: 16,
+                  height: 1.3,
+                ),
+              ),
             const SizedBox(height: 6),
             Row(
               mainAxisSize: MainAxisSize.min,
@@ -1442,7 +2295,6 @@ class _ChatScreenState extends State<ChatScreen> {
                             ? Colors.white.withOpacity(0.8)
                             : Colors.grey.shade500,
                     fontSize: 11,
-                    fontWeight: FontWeight.w500,
                   ),
                 ),
                 if (isMe) ...[
@@ -1461,7 +2313,6 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  // ✅ NEW: BEAUTIFUL RENTAL REQUEST BUBBLE
   Widget _buildRentalRequestBubble(
     Map<String, dynamic> message,
     bool isMe,
@@ -1469,7 +2320,6 @@ class _ChatScreenState extends State<ChatScreen> {
     bool isRead,
     String rawContent,
   ) {
-    // Strip the ugly raw header so we can render it beautifully
     final String cleanContent =
         rawContent.replaceFirst('📅 Rental Request!\n', '').trim();
 
@@ -1504,11 +2354,8 @@ class _ChatScreenState extends State<ChatScreen> {
           maxWidth: MediaQuery.of(context).size.width * 0.80,
         ),
         child: Column(
-          crossAxisAlignment:
-              CrossAxisAlignment
-                  .start, // Left aligned text makes paragraphs much easier to read
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Beautiful Bold Header
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -1522,16 +2369,13 @@ class _ChatScreenState extends State<ChatScreen> {
                   'Rental Request',
                   style: TextStyle(
                     color: isMe ? Colors.white : kPremiumRed,
-                    fontWeight: FontWeight.w900,
+                    fontWeight: FontWeight.bold,
                     fontSize: 14,
-                    letterSpacing: 0.5,
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 8),
-
-            // Clean Body Text
             Text(
               cleanContent,
               style: TextStyle(
@@ -1541,8 +2385,6 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ),
             const SizedBox(height: 8),
-
-            // Standard Timestamp Row aligned to the right
             Align(
               alignment: Alignment.centerRight,
               child: Row(
@@ -1556,7 +2398,6 @@ class _ChatScreenState extends State<ChatScreen> {
                               ? Colors.white.withOpacity(0.8)
                               : Colors.grey.shade500,
                       fontSize: 11,
-                      fontWeight: FontWeight.w500,
                     ),
                   ),
                   if (isMe) ...[
@@ -1649,7 +2490,6 @@ class _ChatScreenState extends State<ChatScreen> {
                     style: TextStyle(
                       color: Colors.grey,
                       fontSize: 12,
-                      letterSpacing: 1.5,
                       fontWeight: FontWeight.bold,
                     ),
                   ),
@@ -1658,9 +2498,8 @@ class _ChatScreenState extends State<ChatScreen> {
                     'AED $offerAmount',
                     style: const TextStyle(
                       fontSize: 32,
-                      fontWeight: FontWeight.w900,
+                      fontWeight: FontWeight.bold,
                       color: kTextPrimary,
-                      letterSpacing: -1,
                     ),
                   ),
                 ],
@@ -1681,11 +2520,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                     child: const Text(
                       'Waiting for seller to respond...',
-                      style: TextStyle(
-                        color: kTextSecondary,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500,
-                      ),
+                      style: TextStyle(color: kTextSecondary, fontSize: 13),
                     ),
                   ),
                 )
@@ -1752,9 +2587,6 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 }
 
-// ============================================================================
-// Custom Animated "Swipe to Release" Widget
-// ============================================================================
 class SwipeToReleaseButton extends StatefulWidget {
   final VoidCallback onConfirmed;
   const SwipeToReleaseButton({super.key, required this.onConfirmed});
@@ -1790,9 +2622,8 @@ class _SwipeToReleaseButtonState extends State<SwipeToReleaseButton> {
                   'Slide to Release Funds ➡️',
                   style: TextStyle(
                     color: Colors.green,
-                    fontWeight: FontWeight.w800,
+                    fontWeight: FontWeight.bold,
                     fontSize: 15,
-                    letterSpacing: 0.5,
                   ),
                 ),
               ),
@@ -1817,9 +2648,7 @@ class _SwipeToReleaseButtonState extends State<SwipeToReleaseButton> {
                       });
                       widget.onConfirmed();
                     } else {
-                      setState(() {
-                        _dragPosition = 0;
-                      });
+                      setState(() => _dragPosition = 0);
                     }
                   },
                   child: AnimatedContainer(

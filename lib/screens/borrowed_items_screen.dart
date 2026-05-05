@@ -5,14 +5,16 @@ import 'package:intl/intl.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_stripe/flutter_stripe.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:shimmer/shimmer.dart';
 import 'chat_screen.dart';
 
 // --- THEME CONSTANTS ---
 const Color kPremiumRed = Color(0xFFD32F2F);
 const Color kBackground = Color(0xFFF5F5F7);
 const Color kSurface = Colors.white;
-const Color kTextPrimary = Color(0xFF212121);
-const Color kTextSecondary = Color(0xFF5A5A5A);
+const Color kTextPrimary = Color(0xFF1A1A1A);
+const Color kTextSecondary = Color(0xFF737373);
+const Color kTextTertiary = Color(0xFFA3A3A3);
 
 class BorrowedItemsScreen extends StatefulWidget {
   const BorrowedItemsScreen({super.key});
@@ -24,7 +26,7 @@ class BorrowedItemsScreen extends StatefulWidget {
 class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
     with SingleTickerProviderStateMixin {
   bool _isLoading = true;
-  bool _isProcessingPayment = false; // Lock screen during Stripe flow
+  bool _isProcessingPayment = false;
   List<Map<String, dynamic>> _pendingRequests = [];
   List<Map<String, dynamic>> _activeRentals = [];
   final String _currentUserId = Supabase.instance.client.auth.currentUser!.id;
@@ -69,7 +71,6 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
           final List<Map<String, dynamic>> allRentals =
               List<Map<String, dynamic>>.from(data);
 
-          // Group pending AND awaiting_payment together in the first tab
           _pendingRequests =
               allRentals
                   .where(
@@ -96,7 +97,6 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
     }
   }
 
-  // --- NEW STRIPE PAYMENT LOGIC ---
   Future<void> _payForRental(Map<String, dynamic> rental) async {
     if (_isProcessingPayment) return;
     setState(() => _isProcessingPayment = true);
@@ -120,7 +120,6 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
 
       final int amountInFils = (totalAmount * 100).toInt();
 
-      // 1. Create Payment Intent
       final response = await http.post(
         Uri.parse('https://api.stripe.com/v1/payment_intents'),
         headers: {
@@ -136,10 +135,8 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
         throw Exception(paymentIntent['error']['message']);
       }
 
-      final String paymentIntentId =
-          paymentIntent['id']; // WE MUST SAVE THIS FOR THE REFUND
+      final String paymentIntentId = paymentIntent['id'];
 
-      // 2. Initialize Payment Sheet
       await Stripe.instance.initPaymentSheet(
         paymentSheetParameters: SetupPaymentSheetParameters(
           paymentIntentClientSecret: paymentIntent['client_secret'],
@@ -148,19 +145,16 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
         ),
       );
 
-      if (mounted) Navigator.pop(context); // Close spinner
+      if (mounted) Navigator.pop(context);
 
-      // 3. Present Sheet
       await Stripe.instance.presentPaymentSheet();
 
-      // 4. If successful, update database!
       await Supabase.instance.client
           .from('rentals')
           .update({
             'status': 'active',
             'payment_status': 'paid',
-            'stripe_payment_intent_id':
-                paymentIntentId, // Saved for refunding the deposit later
+            'stripe_payment_intent_id': paymentIntentId,
           })
           .eq('id', rental['id']);
 
@@ -202,7 +196,6 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
   }
 
   Future<void> _messageOwner(Map<String, dynamic> rental) async {
-    // ... (Your existing message owner logic stays exactly the same)
     try {
       final supabase = Supabase.instance.client;
       final listingId = rental['listings']['id'];
@@ -263,45 +256,86 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
     return Scaffold(
       backgroundColor: kBackground,
       appBar: AppBar(
-        backgroundColor: kBackground,
+        backgroundColor: kSurface,
+        surfaceTintColor: Colors.transparent,
         elevation: 0,
+        scrolledUnderElevation: 0,
         centerTitle: false,
+        iconTheme: const IconThemeData(color: kTextPrimary),
         title: const Text(
           'Borrowed Items',
           style: TextStyle(
-            fontWeight: FontWeight.w800,
             color: kTextPrimary,
             fontSize: 24,
+            fontWeight: FontWeight.bold,
           ),
         ),
-        bottom: TabBar(
-          controller: _tabController,
-          indicatorColor: kPremiumRed,
-          indicatorWeight: 3,
-          labelColor: kPremiumRed,
-          unselectedLabelColor: kTextSecondary,
-          labelStyle: const TextStyle(
-            fontWeight: FontWeight.bold,
-            fontSize: 15,
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(50),
+          child: Container(
+            decoration: BoxDecoration(
+              border: Border(
+                bottom: BorderSide(
+                  color: Colors.black.withOpacity(0.05),
+                  width: 1.5,
+                ),
+              ),
+            ),
+            child: TabBar(
+              controller: _tabController,
+              dividerColor: Colors.transparent,
+              indicatorSize: TabBarIndicatorSize.label,
+              indicatorWeight: 3,
+              indicatorColor: kTextPrimary,
+              labelColor: kTextPrimary,
+              unselectedLabelColor: kTextTertiary,
+              splashFactory: NoSplash.splashFactory,
+              overlayColor: WidgetStateProperty.all(Colors.transparent),
+              labelPadding: const EdgeInsets.symmetric(vertical: 12),
+              labelStyle: const TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.bold,
+              ),
+              unselectedLabelStyle: const TextStyle(fontSize: 15),
+              tabs: [
+                Text('Pending (${_pendingRequests.length})'),
+                Text('Active (${_activeRentals.length})'),
+              ],
+            ),
           ),
-          tabs: [
-            Tab(text: 'Pending (${_pendingRequests.length})'),
-            Tab(text: 'Active (${_activeRentals.length})'),
-          ],
         ),
       ),
       body:
           _isLoading
-              ? const Center(
-                child: CircularProgressIndicator(color: kPremiumRed),
-              )
+              ? _buildShimmerLoadingState()
               : TabBarView(
                 controller: _tabController,
+                physics: const BouncingScrollPhysics(),
                 children: [
                   _buildList(_pendingRequests, isPendingTab: true),
                   _buildList(_activeRentals, isPendingTab: false),
                 ],
               ),
+    );
+  }
+
+  Widget _buildShimmerLoadingState() {
+    return ListView.separated(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
+      itemCount: 4,
+      separatorBuilder: (_, __) => const SizedBox(height: 16),
+      itemBuilder:
+          (_, __) => Shimmer.fromColors(
+            baseColor: Colors.black.withOpacity(0.05),
+            highlightColor: Colors.white,
+            child: Container(
+              height: 180,
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(24),
+              ),
+            ),
+          ),
     );
   }
 
@@ -314,19 +348,53 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(
-              isPendingTab
-                  ? Icons.hourglass_empty_rounded
-                  : Icons.backpack_outlined,
-              size: 48,
-              color: Colors.grey.shade400,
+            Container(
+              padding: const EdgeInsets.all(28),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: Colors.black.withOpacity(0.04),
+                  width: 2,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.02),
+                    blurRadius: 20,
+                    offset: const Offset(0, 10),
+                  ),
+                ],
+              ),
+              child: Icon(
+                isPendingTab
+                    ? Icons.hourglass_empty_rounded
+                    : Icons.backpack_outlined,
+                size: 48,
+                color: kTextTertiary,
+              ),
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 24),
             Text(
               isPendingTab
                   ? 'No pending requests'
-                  : 'You aren\'t renting anything right now',
-              style: TextStyle(color: Colors.grey.shade600, fontSize: 16),
+                  : 'You aren\'t renting anything',
+              style: const TextStyle(
+                color: kTextPrimary,
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              isPendingTab
+                  ? 'When you request to borrow an item,\nit will appear here.'
+                  : 'Items you are actively renting\nwill be tracked here.',
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: kTextSecondary,
+                fontSize: 14,
+                height: 1.5,
+              ),
             ),
           ],
         ),
@@ -336,8 +404,12 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
     return RefreshIndicator(
       onRefresh: _fetchBorrowedItems,
       color: kPremiumRed,
+      backgroundColor: Colors.white,
       child: ListView.separated(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
+        physics: const AlwaysScrollableScrollPhysics(
+          parent: BouncingScrollPhysics(),
+        ),
         itemCount: items.length,
         separatorBuilder: (context, index) => const SizedBox(height: 16),
         itemBuilder:
@@ -368,35 +440,47 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
     return Container(
       decoration: BoxDecoration(
         color: kSurface,
-        borderRadius: BorderRadius.circular(20),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: Colors.black.withOpacity(0.04), width: 1.5),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.04),
+            color: Colors.black.withOpacity(0.02),
             blurRadius: 15,
             offset: const Offset(0, 4),
           ),
         ],
       ),
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(20),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Top Row: Image & Info
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(15),
-                child: Image.network(
-                  itemImage,
-                  width: 70,
-                  height: 70,
-                  fit: BoxFit.cover,
-                  errorBuilder:
-                      (context, error, stackTrace) => Container(
-                        width: 70,
-                        height: 70,
-                        color: Colors.grey.shade200,
-                      ),
+              Container(
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.black.withOpacity(0.05)),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(15),
+                  child: Image.network(
+                    itemImage,
+                    width: 72,
+                    height: 72,
+                    fit: BoxFit.cover,
+                    errorBuilder:
+                        (context, error, stackTrace) => Container(
+                          width: 72,
+                          height: 72,
+                          color: kBackground,
+                          child: const Icon(
+                            Icons.broken_image_rounded,
+                            color: kTextTertiary,
+                          ),
+                        ),
+                  ),
                 ),
               ),
               const SizedBox(width: 16),
@@ -407,27 +491,49 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
                     Text(
                       itemTitle,
                       style: const TextStyle(
-                        fontWeight: FontWeight.w800,
                         fontSize: 17,
                         color: kTextPrimary,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      'Owner: $ownerName',
-                      style: TextStyle(
-                        color: Colors.grey.shade700,
-                        fontSize: 14,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      dateRange,
-                      style: const TextStyle(
-                        color: kPremiumRed,
-                        fontSize: 13,
                         fontWeight: FontWeight.bold,
                       ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.person_outline_rounded,
+                          size: 14,
+                          color: kTextSecondary,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          'Owner: $ownerName',
+                          style: const TextStyle(
+                            color: kTextSecondary,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.calendar_today_outlined,
+                          size: 14,
+                          color: kPremiumRed.withOpacity(0.8),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          dateRange,
+                          style: const TextStyle(
+                            color: kPremiumRed,
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),
@@ -436,10 +542,11 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
           ),
 
           const Padding(
-            padding: EdgeInsets.symmetric(vertical: 16),
+            padding: EdgeInsets.symmetric(vertical: 20),
             child: Divider(height: 1, color: Color(0xFFEEEEEE)),
           ),
 
+          // Payout Details
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -448,30 +555,52 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
                 children: [
                   const Text(
                     'Total Upfront',
-                    style: TextStyle(color: kTextSecondary, fontSize: 12),
+                    style: TextStyle(color: kTextSecondary, fontSize: 13),
                   ),
+                  const SizedBox(height: 4),
                   Text(
                     'AED $totalPaid',
                     style: const TextStyle(
-                      fontWeight: FontWeight.w900,
-                      fontSize: 18,
+                      fontSize: 20,
                       color: kTextPrimary,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
                 ],
               ),
-              Text(
-                'Refundable Deposit: AED $deposit',
-                style: const TextStyle(
-                  color: Colors.teal,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
+              if (deposit > 0)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.teal.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.shield_outlined,
+                        size: 16,
+                        color: Colors.teal,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        'Hold: AED $deposit',
+                        style: const TextStyle(
+                          color: Colors.teal,
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
             ],
           ),
 
-          const SizedBox(height: 20),
+          const SizedBox(height: 24),
 
           // DYNAMIC ACTION BUTTONS
           if (status == 'pending')
@@ -480,10 +609,17 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
               child: OutlinedButton(
                 onPressed: () => _cancelRequest(rental['id']),
                 style: OutlinedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  foregroundColor: kTextSecondary,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  side: BorderSide(color: Colors.black.withOpacity(0.1)),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  foregroundColor: kTextPrimary,
                 ),
-                child: const Text('Cancel Request (Waiting for Owner)'),
+                child: const Text(
+                  'Cancel Request',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                ),
               ),
             )
           else if (status == 'awaiting_payment')
@@ -498,15 +634,26 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.green,
                       foregroundColor: Colors.white,
+                      elevation: 0,
                       padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
                     ),
                   ),
                 ),
+                const SizedBox(height: 8),
                 TextButton(
                   onPressed: () => _cancelRequest(rental['id']),
+                  style: TextButton.styleFrom(
+                    foregroundColor: Colors.red,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
                   child: const Text(
                     'Cancel Request',
-                    style: TextStyle(color: Colors.red),
+                    style: TextStyle(fontWeight: FontWeight.bold),
                   ),
                 ),
               ],
@@ -517,11 +664,18 @@ class _BorrowedItemsScreenState extends State<BorrowedItemsScreen>
               child: ElevatedButton.icon(
                 onPressed: () => _messageOwner(rental),
                 icon: const Icon(Icons.chat_bubble_outline_rounded, size: 18),
-                label: const Text('Message Owner to Return'),
+                label: const Text(
+                  'Message Owner to Return',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                ),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: kPremiumRed,
                   foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  elevation: 0,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
                 ),
               ),
             ),

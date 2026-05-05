@@ -136,7 +136,7 @@ class _HomeScreenState extends State<HomeScreen> {
         });
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Error updating saved items: $e'),
+            content: Text('Error updating favorites: $e'),
             backgroundColor: kPremiumRed,
           ),
         );
@@ -693,6 +693,11 @@ class _HomeScreenState extends State<HomeScreen> {
     final String currentUserId = Supabase.instance.client.auth.currentUser!.id;
     final bool isMyRequest = req['requester_id'] == currentUserId;
 
+    // Optional new fields (will be null if you haven't added them to DB yet)
+    final String? imageUrl = req['reference_image'];
+    final String? preferredCondition = req['preferred_condition'];
+    final String? urgency = req['urgency'];
+
     return Container(
       margin: const EdgeInsets.only(bottom: 16),
       decoration: BoxDecoration(
@@ -714,19 +719,33 @@ class _HomeScreenState extends State<HomeScreen> {
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                CircleAvatar(
-                  radius: 24,
-                  backgroundColor: kPremiumRed.withOpacity(0.1),
-                  child: Text(
-                    requesterName[0].toUpperCase(),
-                    style: const TextStyle(
-                      color: kPremiumRed,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 20,
+                // Reference Image OR User Avatar
+                if (imageUrl != null && imageUrl.isNotEmpty)
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: CachedNetworkImage(
+                      imageUrl: imageUrl,
+                      width: 60,
+                      height: 60,
+                      fit: BoxFit.cover,
+                    ),
+                  )
+                else
+                  CircleAvatar(
+                    radius: 24,
+                    backgroundColor: kPremiumRed.withOpacity(0.1),
+                    child: Text(
+                      requesterName[0].toUpperCase(),
+                      style: const TextStyle(
+                        color: kPremiumRed,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 20,
+                      ),
                     ),
                   ),
-                ),
                 const SizedBox(width: 16),
+
+                // Title and Requester Info
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -751,6 +770,8 @@ class _HomeScreenState extends State<HomeScreen> {
                     ],
                   ),
                 ),
+
+                // Budget Box
                 Container(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 10,
@@ -761,22 +782,36 @@ class _HomeScreenState extends State<HomeScreen> {
                     borderRadius: BorderRadius.circular(10),
                     border: Border.all(color: Colors.green.shade200),
                   ),
-                  child: Text(
-                    'AED ${req['budget']}',
-                    style: TextStyle(
-                      color: Colors.green.shade700,
-                      fontWeight: FontWeight.w900,
-                      fontSize: 14,
-                    ),
+                  child: Column(
+                    children: [
+                      const Text(
+                        'Willing to pay',
+                        style: TextStyle(
+                          color: Colors.green,
+                          fontSize: 9,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      Text(
+                        'AED ${req['budget']}',
+                        style: TextStyle(
+                          color: Colors.green.shade700,
+                          fontWeight: FontWeight.w900,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
             ),
           ),
+
+          // Description
           if (req['description'] != null &&
               req['description'].toString().isNotEmpty)
             Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
               child: Text(
                 req['description'],
                 style: const TextStyle(
@@ -786,6 +821,57 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
             ),
+
+          // Details Tags (Condition & Urgency)
+          if (preferredCondition != null || urgency != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+              child: Wrap(
+                spacing: 8,
+                children: [
+                  if (preferredCondition != null)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade100,
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        'Condition: $preferredCondition',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: kTextSecondary,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  if (urgency != null)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.orange.shade50,
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        'Needed: $urgency',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.orange.shade800,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+
+          // Bottom Action Bar
           Container(
             decoration: BoxDecoration(
               color: Colors.grey.shade50,
@@ -895,6 +981,13 @@ class _HomeScreenState extends State<HomeScreen> {
                 .select('id')
                 .single();
         chatId = newChat['id'];
+
+        // --- NEW: AUTOMATED ICEBREAKER MESSAGE ---
+        await Supabase.instance.client.from('messages').insert({
+          'chat_id': chatId,
+          'sender_id': currentUserId,
+          'content': '👋 Hi! I have the "${req['title']}" you are looking for.',
+        });
       }
 
       if (mounted) {
@@ -1240,14 +1333,12 @@ class _CompactProductCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: () {
-        // Find the parent HomeScreen state to call fetch after returning
         Navigator.push(
           context,
           MaterialPageRoute(
             builder: (context) => ItemDetailsScreen(item: item),
           ),
         ).then((_) {
-          // Trigger a rebuild of the home screen to fetch new saved status
           context
               .findAncestorStateOfType<_HomeScreenState>()
               ?._fetchSavedItemIds();

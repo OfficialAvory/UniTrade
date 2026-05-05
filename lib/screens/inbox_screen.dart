@@ -24,47 +24,88 @@ class InboxScreen extends StatefulWidget {
   State<InboxScreen> createState() => _InboxScreenState();
 }
 
-class _InboxScreenState extends State<InboxScreen> {
+class _InboxScreenState extends State<InboxScreen> with WidgetsBindingObserver {
   bool _isLoading = true;
   List<Map<String, dynamic>> _allChats = [];
   final String _currentUserId = Supabase.instance.client.auth.currentUser!.id;
 
-  int _selectedTabIndex = 0;
+  int _selectedCategoryIndex = 0; // 0: Buying, 1: Selling, 2: Rentals
   int _lendingActionCount = 0;
   int _borrowingActionCount = 0;
+
+  // --- NEW: Track Block States ---
+  Set<String> _blockedByMe = {};
 
   late final RealtimeChannel _activityChannel;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _fetchInbox();
     _fetchRentalCounts();
     _setupRealtime();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _fetchInbox();
+      _fetchRentalCounts();
+    }
+  }
+
   void _setupRealtime() {
     _activityChannel = Supabase.instance.client.channel(
-      'public:inbox_activity',
+      'inbox_$_currentUserId',
     );
+
     _activityChannel
         .onPostgresChanges(
           event: PostgresChangeEvent.all,
           schema: 'public',
           table: 'messages',
-          callback: (payload) => _fetchInbox(),
+          callback: (payload) {
+            debugPrint('Realtime update: Messages table changed');
+            _fetchInbox();
+          },
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'chats',
+          callback: (payload) {
+            debugPrint('Realtime update: Chats table changed');
+            _fetchInbox();
+          },
         )
         .onPostgresChanges(
           event: PostgresChangeEvent.all,
           schema: 'public',
           table: 'rentals',
-          callback: (payload) => _fetchRentalCounts(),
+          callback: (payload) {
+            debugPrint('Realtime update: Rentals table changed');
+            _fetchRentalCounts();
+          },
         )
-        .subscribe();
+        // Also listen for blocks being added/removed to update UI instantly
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'blocks',
+          callback: (payload) {
+            debugPrint('Realtime update: Blocks table changed');
+            _fetchInbox();
+          },
+        )
+        .subscribe((status, [error]) {
+          debugPrint('Realtime subscription status: $status');
+        });
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     Supabase.instance.client.removeChannel(_activityChannel);
     super.dispose();
   }
@@ -96,7 +137,25 @@ class _InboxScreenState extends State<InboxScreen> {
 
   Future<void> _fetchInbox() async {
     try {
-      final data = await Supabase.instance.client
+      final supabase = Supabase.instance.client;
+
+      // 1. FETCH BLOCKS safely
+      final blocksData = await supabase
+          .from('blocks')
+          .select('blocker_id, blocked_id')
+          .or('blocker_id.eq.$_currentUserId,blocked_id.eq.$_currentUserId');
+
+      Set<String> tempBlockedByMe = {};
+      Set<String> blockedMe = {};
+
+      for (var b in blocksData) {
+        if (b['blocker_id'] == _currentUserId)
+          tempBlockedByMe.add(b['blocked_id']);
+        if (b['blocked_id'] == _currentUserId) blockedMe.add(b['blocker_id']);
+      }
+
+      // 2. FETCH CHATS
+      final data = await supabase
           .from('chats')
           .select('''
             id, buyer_id, seller_id, payment_status, hidden_by_buyer, hidden_by_seller, created_at,
@@ -110,8 +169,19 @@ class _InboxScreenState extends State<InboxScreen> {
 
       if (mounted) {
         setState(() {
+          _blockedByMe = tempBlockedByMe;
           List<Map<String, dynamic>> processedChats =
               List<Map<String, dynamic>>.from(data);
+
+          // 3. FILTER OUT CHATS IF THEY BLOCKED US (The "Silent Block" effect)
+          processedChats.removeWhere((chat) {
+            final otherUserId =
+                chat['buyer_id'] == _currentUserId
+                    ? chat['seller_id']
+                    : chat['buyer_id'];
+            return blockedMe.contains(otherUserId);
+          });
+
           for (var chat in processedChats) {
             List<dynamic> msgs = chat['messages'] ?? [];
             msgs.sort(
@@ -119,14 +189,26 @@ class _InboxScreenState extends State<InboxScreen> {
                 b['created_at'],
               ).compareTo(DateTime.parse(a['created_at'])),
             );
-            chat['unread_count'] =
-                msgs
-                    .where(
-                      (m) =>
-                          m['is_read'] == false &&
-                          m['sender_id'] != _currentUserId,
-                    )
-                    .length;
+
+            final otherUserId =
+                chat['buyer_id'] == _currentUserId
+                    ? chat['seller_id']
+                    : chat['buyer_id'];
+
+            // Do not show unread badges if we blocked them
+            if (_blockedByMe.contains(otherUserId)) {
+              chat['unread_count'] = 0;
+            } else {
+              chat['unread_count'] =
+                  msgs
+                      .where(
+                        (m) =>
+                            m['is_read'] == false &&
+                            m['sender_id'] != _currentUserId,
+                      )
+                      .length;
+            }
+
             if (msgs.isNotEmpty) {
               chat['last_message'] = msgs.first;
               chat['updated_at'] = msgs.first['created_at'];
@@ -145,6 +227,7 @@ class _InboxScreenState extends State<InboxScreen> {
         });
       }
     } catch (e) {
+      debugPrint('Error fetching inbox: $e');
       if (mounted) setState(() => _isLoading = false);
     }
   }
@@ -185,126 +268,271 @@ class _InboxScreenState extends State<InboxScreen> {
     final date = DateTime.parse(isoString).toLocal();
     final now = DateTime.now();
     final diff = now.difference(date);
-    if (diff.inDays == 0 && now.day == date.day)
+    if (diff.inDays == 0 && now.day == date.day) {
       return DateFormat('h:mm a').format(date);
-    if (diff.inDays == 1 || (diff.inDays == 0 && now.day != date.day))
+    }
+    if (diff.inDays == 1 || (diff.inDays == 0 && now.day != date.day)) {
       return 'Yesterday';
+    }
     if (diff.inDays < 7) return DateFormat('EEEE').format(date);
     return DateFormat('MMM d').format(date);
   }
 
+  int get _unreadBuyingCount {
+    return _allChats
+        .where(
+          (chat) =>
+              chat['buyer_id'] == _currentUserId &&
+              chat['hidden_by_buyer'] != true,
+        )
+        .fold(0, (sum, chat) => sum + (chat['unread_count'] as int? ?? 0));
+  }
+
+  int get _unreadSellingCount {
+    return _allChats
+        .where(
+          (chat) =>
+              chat['buyer_id'] != _currentUserId &&
+              chat['hidden_by_seller'] != true,
+        )
+        .fold(0, (sum, chat) => sum + (chat['unread_count'] as int? ?? 0));
+  }
+
+  int get _totalRentalActions => _lendingActionCount + _borrowingActionCount;
+
+  bool get _hasUnreadInOtherCategories {
+    if (_selectedCategoryIndex != 0 && _unreadBuyingCount > 0) return true;
+    if (_selectedCategoryIndex != 1 && _unreadSellingCount > 0) return true;
+    if (_selectedCategoryIndex != 2 && _totalRentalActions > 0) return true;
+    return false;
+  }
+
+  String get _currentCategoryName {
+    if (_selectedCategoryIndex == 0) return 'Buying';
+    if (_selectedCategoryIndex == 1) return 'Selling';
+    return 'Rentals';
+  }
+
+  void _showCategorySelector() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.only(bottom: 32, top: 12),
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(32)),
+          ),
+          child: SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 40,
+                  height: 5,
+                  margin: const EdgeInsets.only(bottom: 24),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+                _buildCategoryOption(
+                  0,
+                  'Buying',
+                  Icons.shopping_bag_outlined,
+                  badgeCount: _unreadBuyingCount,
+                ),
+                _buildCategoryOption(
+                  1,
+                  'Selling',
+                  Icons.storefront_outlined,
+                  badgeCount: _unreadSellingCount,
+                ),
+                _buildCategoryOption(
+                  2,
+                  'Rentals',
+                  Icons.key_outlined,
+                  badgeCount: _totalRentalActions,
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildCategoryOption(
+    int index,
+    String title,
+    IconData icon, {
+    int badgeCount = 0,
+  }) {
+    final isSelected = _selectedCategoryIndex == index;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: () {
+          setState(() => _selectedCategoryIndex = index);
+          Navigator.pop(context);
+          _fetchInbox();
+          _fetchRentalCounts();
+        },
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+          child: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: isSelected ? kTextPrimary : kBackground,
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  icon,
+                  color: isSelected ? Colors.white : kTextPrimary,
+                  size: 22,
+                ),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight:
+                        isSelected ? FontWeight.bold : FontWeight.normal,
+                    color: isSelected ? kTextPrimary : kTextSecondary,
+                  ),
+                ),
+              ),
+              if (badgeCount > 0)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 4,
+                  ),
+                  margin: const EdgeInsets.only(right: 8),
+                  decoration: BoxDecoration(
+                    color: kPremiumRed,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    badgeCount.toString(),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              if (isSelected)
+                const Icon(Icons.check_circle_rounded, color: kTextPrimary)
+              else
+                const SizedBox(width: 24),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final filteredChats =
-        _allChats.where((chat) {
-          final isBuyer = chat['buyer_id'] == _currentUserId;
-          if (isBuyer && chat['hidden_by_buyer'] == true) return false;
-          if (!isBuyer && chat['hidden_by_seller'] == true) return false;
-          return _selectedTabIndex == 0
-              ? isBuyer
-              : _selectedTabIndex == 1
-              ? !isBuyer
-              : false;
-        }).toList();
+    final buyingChats =
+        _allChats
+            .where(
+              (chat) =>
+                  chat['buyer_id'] == _currentUserId &&
+                  chat['hidden_by_buyer'] != true,
+            )
+            .toList();
+
+    final sellingChats =
+        _allChats
+            .where(
+              (chat) =>
+                  chat['buyer_id'] != _currentUserId &&
+                  chat['hidden_by_seller'] != true,
+            )
+            .toList();
 
     return Scaffold(
       backgroundColor: kBackground,
       appBar: AppBar(
-        title: const Text(
-          'Activity',
-          style: TextStyle(
-            fontWeight: FontWeight.w800,
-            color: kTextPrimary,
-            fontSize: 26,
-            letterSpacing: -0.5,
+        title: GestureDetector(
+          onTap: _showCategorySelector,
+          behavior: HitTestBehavior.opaque,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                _currentCategoryName,
+                style: const TextStyle(
+                  color: kTextPrimary,
+                  fontSize: 28,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(width: 4),
+              const Icon(
+                Icons.keyboard_arrow_down_rounded,
+                color: kTextPrimary,
+                size: 28,
+              ),
+              if (_hasUnreadInOtherCategories)
+                Container(
+                  margin: const EdgeInsets.only(left: 6, bottom: 8),
+                  width: 8,
+                  height: 8,
+                  decoration: const BoxDecoration(
+                    color: kPremiumRed,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+            ],
           ),
         ),
         centerTitle: false,
         backgroundColor: kBackground,
+        surfaceTintColor: Colors.transparent,
         elevation: 0,
         scrolledUnderElevation: 0,
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(65),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
-            child: Container(
-              height: 48,
-              padding: const EdgeInsets.all(4),
-              decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.04),
-                borderRadius: BorderRadius.circular(24),
-              ),
-              child: Stack(
-                children: [
-                  AnimatedAlign(
-                    alignment: Alignment(
-                      _selectedTabIndex == 0
-                          ? -1.0
-                          : _selectedTabIndex == 1
-                          ? 0.0
-                          : 1.0,
-                      0,
-                    ),
-                    duration: const Duration(milliseconds: 250),
-                    curve: Curves.fastOutSlowIn,
-                    child: FractionallySizedBox(
-                      widthFactor: 0.333,
-                      heightFactor: 1.0,
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(20),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withOpacity(0.08),
-                              blurRadius: 8,
-                              offset: const Offset(0, 3),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                  Row(
-                    children: [
-                      _buildSegmentTab(0, 'Buying'),
-                      _buildSegmentTab(1, 'Selling'),
-                      _buildSegmentTab(
-                        2,
-                        'Rentals',
-                        badgeCount: _lendingActionCount + _borrowingActionCount,
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
       ),
       body:
-          _selectedTabIndex == 2
-              ? _buildRentalsDashboard()
-              : _isLoading
+          _isLoading
               ? _buildShimmerLoadingState()
-              : RefreshIndicator(
-                onRefresh: _fetchInbox,
-                color: kPremiumRed,
-                child:
-                    filteredChats.isEmpty
-                        ? _buildEmptyState()
-                        : ListView.separated(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 20,
-                            vertical: 16,
-                          ),
-                          itemCount: filteredChats.length,
-                          separatorBuilder:
-                              (_, __) => const SizedBox(height: 12),
-                          itemBuilder:
-                              (context, index) =>
-                                  _buildPremiumChatCard(filteredChats[index]),
-                        ),
+              : _selectedCategoryIndex == 2
+              ? _buildRentalsDashboard()
+              : _buildChatList(
+                _selectedCategoryIndex == 0 ? buyingChats : sellingChats,
+                _selectedCategoryIndex == 0,
+              ),
+    );
+  }
+
+  Widget _buildChatList(List<Map<String, dynamic>> chats, bool isBuyingTab) {
+    return RefreshIndicator(
+      onRefresh: _fetchInbox,
+      color: kPremiumRed,
+      backgroundColor: Colors.white,
+      child:
+          chats.isEmpty
+              ? _buildEmptyState(isBuyingTab)
+              : ListView.separated(
+                physics: const AlwaysScrollableScrollPhysics(
+                  parent: BouncingScrollPhysics(),
+                ),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 16,
+                ),
+                itemCount: chats.length,
+                separatorBuilder: (_, __) => const SizedBox(height: 12),
+                itemBuilder:
+                    (context, index) => _buildPremiumChatCard(chats[index]),
               ),
     );
   }
@@ -316,13 +544,42 @@ class _InboxScreenState extends State<InboxScreen> {
       separatorBuilder: (_, __) => const SizedBox(height: 12),
       itemBuilder:
           (_, __) => Shimmer.fromColors(
-            baseColor: Colors.grey.shade200,
+            baseColor: Colors.black.withOpacity(0.05),
             highlightColor: Colors.white,
             child: Container(
-              height: 100,
+              padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
                 color: Colors.white,
                 borderRadius: BorderRadius.circular(24),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 60,
+                    height: 60,
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(width: 120, height: 14, color: Colors.white),
+                        const SizedBox(height: 8),
+                        Container(
+                          width: double.infinity,
+                          height: 16,
+                          color: Colors.white,
+                        ),
+                        const SizedBox(height: 8),
+                        Container(width: 180, height: 12, color: Colors.white),
+                      ],
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
@@ -333,164 +590,135 @@ class _InboxScreenState extends State<InboxScreen> {
     return RefreshIndicator(
       onRefresh: () async => await _fetchRentalCounts(),
       color: kPremiumRed,
+      backgroundColor: Colors.white,
       child: ListView(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+        physics: const AlwaysScrollableScrollPhysics(
+          parent: BouncingScrollPhysics(),
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
         children: [
-          _buildPremiumRentalCard(
-            title: 'Borrowed Items',
-            subtitle: 'Track the items you are currently renting.',
-            emptyHint: 'No active borrowed items.',
-            icon: Icons.backpack_rounded,
-            badgeCount: _borrowingActionCount,
-            onTap:
-                () => Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => const BorrowedItemsScreen(),
-                  ),
-                ).then((_) => _fetchRentalCounts()),
-          ),
-          const SizedBox(height: 16),
-          _buildPremiumRentalCard(
-            title: 'Lending Manager',
-            subtitle: 'Approve requests & manage items out for rent.',
-            emptyHint: 'All caught up! No pending approvals.',
-            icon: Icons.key_rounded,
-            badgeCount: _lendingActionCount,
-            onTap:
-                () => Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => const ManageRentalsScreen(),
-                  ),
-                ).then((_) => _fetchRentalCounts()),
+          Row(
+            children: [
+              Expanded(
+                child: _buildBentoCard(
+                  title: 'Borrowed Items',
+                  subtitle: 'Items you rent',
+                  icon: Icons.backpack_rounded,
+                  badgeCount: _borrowingActionCount,
+                  onTap:
+                      () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => const BorrowedItemsScreen(),
+                        ),
+                      ).then((_) => _fetchRentalCounts()),
+                ),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: _buildBentoCard(
+                  title: 'Lending Manager',
+                  subtitle: 'Pending approvals',
+                  icon: Icons.key_rounded,
+                  badgeCount: _lendingActionCount,
+                  onTap:
+                      () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => const ManageRentalsScreen(),
+                        ),
+                      ).then((_) => _fetchRentalCounts()),
+                ),
+              ),
+            ],
           ),
         ],
       ),
     );
   }
 
-  Widget _buildPremiumRentalCard({
+  Widget _buildBentoCard({
     required String title,
     required String subtitle,
-    required String emptyHint,
     required IconData icon,
     required VoidCallback onTap,
     int badgeCount = 0,
   }) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.all(24),
-        decoration: BoxDecoration(
-          color: kSurface,
-          borderRadius: BorderRadius.circular(24),
-          border: Border.all(color: Colors.black.withOpacity(0.04), width: 1.5),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.02),
-              blurRadius: 20,
-              offset: const Offset(0, 8),
-            ),
-          ],
-        ),
-        child: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: kBackground,
-                shape: BoxShape.circle,
-                border: Border.all(color: Colors.black.withOpacity(0.05)),
-              ),
-              child: Icon(icon, color: kTextPrimary, size: 24),
-            ),
-            const SizedBox(width: 18),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: const TextStyle(
-                      fontSize: 17,
-                      fontWeight: FontWeight.w800,
-                      color: kTextPrimary,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    badgeCount > 0 ? subtitle : emptyHint,
-                    style: TextStyle(
-                      fontSize: 13,
-                      height: 1.4,
-                      color: badgeCount > 0 ? kTextSecondary : kTextTertiary,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            if (badgeCount > 0)
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 6,
-                ),
-                decoration: BoxDecoration(
-                  color: kPremiumRed,
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                child: Text(
-                  badgeCount.toString(),
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              )
-            else
-              Icon(
-                Icons.arrow_forward_ios_rounded,
-                size: 16,
-                color: Colors.grey.shade400,
-              ),
-          ],
-        ),
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: Colors.black.withOpacity(0.04), width: 1.5),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.02),
+            blurRadius: 15,
+            offset: const Offset(0, 8),
+          ),
+        ],
       ),
-    );
-  }
-
-  Widget _buildSegmentTab(int index, String title, {int badgeCount = 0}) {
-    final isSelected = _selectedTabIndex == index;
-    return Expanded(
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: () => setState(() => _selectedTabIndex = index),
-        child: Center(
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text(
-                title,
-                style: TextStyle(
-                  color: isSelected ? kTextPrimary : kTextSecondary,
-                  fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
-                  fontSize: 14,
+      child: Material(
+        color: kSurface,
+        borderRadius: BorderRadius.circular(24),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color:
+                            badgeCount > 0
+                                ? kPremiumRed.withOpacity(0.08)
+                                : kBackground,
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        icon,
+                        color: badgeCount > 0 ? kPremiumRed : kTextPrimary,
+                        size: 26,
+                      ),
+                    ),
+                    if (badgeCount > 0)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: kPremiumRed,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Text(
+                          badgeCount.toString(),
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
-              ),
-              if (badgeCount > 0) ...[
-                const SizedBox(width: 6),
-                Container(
-                  width: 8,
-                  height: 8,
-                  decoration: const BoxDecoration(
-                    color: kPremiumRed,
-                    shape: BoxShape.circle,
-                  ),
+                const SizedBox(height: 32),
+                Text(
+                  title,
+                  style: const TextStyle(color: kTextPrimary, fontSize: 16),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  subtitle,
+                  style: const TextStyle(color: kTextSecondary, fontSize: 13),
                 ),
               ],
-            ],
+            ),
           ),
         ),
       ),
@@ -503,6 +731,7 @@ class _InboxScreenState extends State<InboxScreen> {
         isBuyer ? chat['seller']['full_name'] : chat['buyer']['full_name'];
     final userInitial =
         (otherName as String).isNotEmpty ? otherName[0].toUpperCase() : '?';
+    final otherUserId = isBuyer ? chat['seller_id'] : chat['buyer_id'];
 
     final isRequest = chat['requests'] != null;
     final String itemTitle =
@@ -518,9 +747,14 @@ class _InboxScreenState extends State<InboxScreen> {
 
     final lastMessage = chat['last_message'];
     final bool hasUnread = (chat['unread_count'] ?? 0) > 0;
+    final bool isBlockedByMe = _blockedByMe.contains(otherUserId);
 
     String preview = 'Tap to start chatting';
-    if (isSold && payStatus != 'completed') {
+
+    // --- SHOW BLOCKED STATUS IN INBOX ---
+    if (isBlockedByMe) {
+      preview = '🚫 You blocked this user';
+    } else if (isSold && payStatus != 'completed') {
       preview = 'Item unavailable';
     } else if (lastMessage != null) {
       preview =
@@ -563,209 +797,223 @@ class _InboxScreenState extends State<InboxScreen> {
           ),
         ],
       ),
-      child: GestureDetector(
-        onTap:
-            () => Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder:
-                    (context) => ChatScreen(
-                      chatId: chat['id'],
-                      otherUserName: otherName,
-                      itemTitle: itemTitle,
-                    ),
-              ),
-            ).then((_) => _fetchInbox()),
-        child: Container(
-          decoration: BoxDecoration(
-            color: hasUnread ? kPremiumRed.withOpacity(0.02) : kSurface,
-            borderRadius: BorderRadius.circular(24),
-            border: Border.all(
-              color:
-                  hasUnread
-                      ? kPremiumRed.withOpacity(0.3)
-                      : Colors.black.withOpacity(0.04),
-              width: 1.5,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withOpacity(0.02),
-                blurRadius: 10,
-                offset: const Offset(0, 4),
-              ),
-            ],
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(
+            color:
+                hasUnread
+                    ? kPremiumRed.withOpacity(0.3)
+                    : Colors.black.withOpacity(0.04),
+            width: 1.5,
           ),
-          padding: const EdgeInsets.all(16),
-          child: Row(
-            children: [
-              SizedBox(
-                width: 64,
-                height: 64,
-                child: Stack(
-                  clipBehavior: Clip.none,
-                  children: [
-                    Container(
-                      width: 60,
-                      height: 60,
-                      decoration: BoxDecoration(
-                        border: Border.all(
-                          color: Colors.black.withOpacity(0.05),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.02),
+              blurRadius: 10,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Material(
+          color: hasUnread ? kPremiumRed.withOpacity(0.02) : kSurface,
+          borderRadius: BorderRadius.circular(24),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap:
+                () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder:
+                        (context) => ChatScreen(
+                          chatId: chat['id'],
+                          otherUserName: otherName,
+                          itemTitle: itemTitle,
                         ),
-                        borderRadius: BorderRadius.circular(16),
-                        color: isRequest ? kBackground : null,
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(15),
-                        child:
-                            itemImage != null
-                                ? CachedNetworkImage(
-                                  imageUrl: itemImage,
-                                  fit: BoxFit.cover,
-                                  color:
-                                      isSold
-                                          ? Colors.white.withOpacity(0.5)
-                                          : null,
-                                  colorBlendMode:
-                                      isSold ? BlendMode.modulate : null,
-                                  placeholder:
-                                      (_, __) => Container(color: kBackground),
-                                  errorWidget:
-                                      (_, __, ___) => _buildPlaceholderImage(),
-                                )
-                                : isRequest
-                                ? const Icon(
-                                  Icons.campaign_rounded,
-                                  color: kTextSecondary,
-                                  size: 28,
-                                )
-                                : _buildPlaceholderImage(),
-                      ),
+                  ),
+                ).then(
+                  (_) => _fetchInbox(),
+                ), // Re-fetches on return in case they unblocked
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 64,
+                    height: 64,
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        Container(
+                          width: 60,
+                          height: 60,
+                          decoration: BoxDecoration(
+                            border: Border.all(
+                              color: Colors.black.withOpacity(0.05),
+                            ),
+                            borderRadius: BorderRadius.circular(16),
+                            color: isRequest ? kBackground : null,
+                          ),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(15),
+                            child:
+                                itemImage != null
+                                    ? CachedNetworkImage(
+                                      imageUrl: itemImage,
+                                      fit: BoxFit.cover,
+                                      color:
+                                          isSold
+                                              ? Colors.white.withOpacity(0.5)
+                                              : null,
+                                      colorBlendMode:
+                                          isSold ? BlendMode.modulate : null,
+                                      placeholder:
+                                          (_, __) =>
+                                              Container(color: kBackground),
+                                      errorWidget:
+                                          (_, __, ___) =>
+                                              _buildPlaceholderImage(),
+                                    )
+                                    : isRequest
+                                    ? const Icon(
+                                      Icons.campaign_rounded,
+                                      color: kTextSecondary,
+                                      size: 28,
+                                    )
+                                    : _buildPlaceholderImage(),
+                          ),
+                        ),
+                        Positioned(
+                          bottom: -4,
+                          right: -4,
+                          child: Container(
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.white,
+                              border: Border.all(color: Colors.white, width: 2),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withOpacity(0.1),
+                                  blurRadius: 4,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ],
+                            ),
+                            child: CircleAvatar(
+                              radius: 12,
+                              backgroundColor: Colors.grey.shade800,
+                              child: Text(
+                                userInitial,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                    Positioned(
-                      bottom: -4,
-                      right: -4,
-                      child: Container(
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Colors.white,
-                          border: Border.all(color: Colors.white, width: 2),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withOpacity(0.1),
-                              blurRadius: 4,
-                              offset: const Offset(0, 2),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Expanded(
+                              child: Text(
+                                otherName,
+                                style: const TextStyle(
+                                  color: kTextSecondary,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            Text(
+                              _formatTimestamp(chat['updated_at']),
+                              style: TextStyle(
+                                color: hasUnread ? kPremiumRed : kTextTertiary,
+                                fontSize: 11,
+                                fontWeight:
+                                    hasUnread
+                                        ? FontWeight.bold
+                                        : FontWeight.normal,
+                              ),
                             ),
                           ],
                         ),
-                        child: CircleAvatar(
-                          radius: 12,
-                          backgroundColor: Colors.grey.shade800,
-                          child: Text(
-                            userInitial,
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 10,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Expanded(
-                          child: Text(
-                            otherName,
-                            style: TextStyle(
-                              color: kTextSecondary,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600,
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
+                        const SizedBox(height: 2),
                         Text(
-                          _formatTimestamp(chat['updated_at']),
+                          itemTitle,
                           style: TextStyle(
-                            color: hasUnread ? kPremiumRed : kTextTertiary,
-                            fontSize: 11,
-                            fontWeight:
-                                hasUnread ? FontWeight.bold : FontWeight.w500,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color:
+                                isSold && payStatus != 'completed'
+                                    ? Colors.grey
+                                    : kTextPrimary,
+                            decoration:
+                                isSold && payStatus != 'completed'
+                                    ? TextDecoration.lineThrough
+                                    : null,
                           ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 2),
+                        Row(
+                          children: [
+                            if (hasUnread)
+                              Container(
+                                width: 6,
+                                height: 6,
+                                margin: const EdgeInsets.only(right: 6),
+                                decoration: const BoxDecoration(
+                                  color: kPremiumRed,
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
+                            Expanded(
+                              child: Text(
+                                preview,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color:
+                                      isBlockedByMe
+                                          ? kPremiumRed
+                                          : (isSold && payStatus != 'completed'
+                                              ? kTextTertiary
+                                              : (hasUnread
+                                                  ? kTextPrimary
+                                                  : kTextSecondary)),
+                                  fontSize: 14,
+                                  fontStyle:
+                                      isSold && payStatus != 'completed'
+                                          ? FontStyle.italic
+                                          : FontStyle.normal,
+                                  fontWeight:
+                                      hasUnread || isBlockedByMe
+                                          ? FontWeight.bold
+                                          : FontWeight.normal,
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
                       ],
                     ),
-                    const SizedBox(height: 2),
-                    Text(
-                      itemTitle,
-                      style: TextStyle(
-                        fontWeight: FontWeight.w800,
-                        fontSize: 16,
-                        color:
-                            isSold && payStatus != 'completed'
-                                ? Colors.grey
-                                : kTextPrimary,
-                        decoration:
-                            isSold && payStatus != 'completed'
-                                ? TextDecoration.lineThrough
-                                : null,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    const SizedBox(height: 2),
-                    Row(
-                      children: [
-                        if (hasUnread)
-                          Container(
-                            width: 6,
-                            height: 6,
-                            margin: const EdgeInsets.only(right: 6),
-                            decoration: const BoxDecoration(
-                              color: kPremiumRed,
-                              shape: BoxShape.circle,
-                            ),
-                          ),
-                        Expanded(
-                          child: Text(
-                            preview,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color:
-                                  isSold && payStatus != 'completed'
-                                      ? kTextTertiary
-                                      : (hasUnread
-                                          ? kTextPrimary
-                                          : kTextSecondary),
-                              fontSize: 14,
-                              fontStyle:
-                                  isSold && payStatus != 'completed'
-                                      ? FontStyle.italic
-                                      : FontStyle.normal,
-                              fontWeight:
-                                  hasUnread
-                                      ? FontWeight.w600
-                                      : FontWeight.normal,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
         ),
       ),
@@ -777,7 +1025,7 @@ class _InboxScreenState extends State<InboxScreen> {
     child: const Icon(Icons.image_rounded, color: kTextTertiary, size: 24),
   );
 
-  Widget _buildEmptyState() {
+  Widget _buildEmptyState(bool isBuyingTab) {
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
@@ -807,18 +1055,16 @@ class _InboxScreenState extends State<InboxScreen> {
           ),
           const SizedBox(height: 24),
           Text(
-            _selectedTabIndex == 0
-                ? "No buying activity"
-                : "No selling activity",
+            isBuyingTab ? "No buying activity" : "No selling activity",
             style: const TextStyle(
               color: kTextPrimary,
               fontSize: 18,
-              fontWeight: FontWeight.w800,
+              fontWeight: FontWeight.bold,
             ),
           ),
           const SizedBox(height: 8),
           Text(
-            _selectedTabIndex == 0
+            isBuyingTab
                 ? "Items you inquire about\nwill appear here."
                 : "When someone messages you,\ntheir chats will appear here.",
             textAlign: TextAlign.center,

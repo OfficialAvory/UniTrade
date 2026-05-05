@@ -1222,6 +1222,7 @@ class _ItemDetailsScreenState extends State<ItemDetailsScreen> {
     );
   }
 
+  // --- NEW: UPDATED BOTTOM ACTION BAR ---
   Widget _buildBottomActionBar() {
     final bool isSold = widget.item['is_sold'] ?? false;
     final bool isBuyer = widget.item['buyer_id'] == _currentUserId;
@@ -1273,64 +1274,114 @@ class _ItemDetailsScreenState extends State<ItemDetailsScreen> {
               ),
             ),
           ] else ...[
-            Expanded(
-              flex: 1,
-              child: OutlinedButton(
-                onPressed:
-                    (_isStartingChat || isSold)
-                        ? null
-                        : (_isSelling ? _showOfferDialog : _startChat),
-                style: OutlinedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  side: const BorderSide(color: kPremiumRed, width: 2),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  foregroundColor: kPremiumRed,
+            // --- NEW: DEDICATED CHAT BUTTON ---
+            Container(
+              height: 54,
+              width: 54,
+              decoration: BoxDecoration(
+                border: Border.all(
+                  color: isSold ? Colors.grey.shade300 : kPremiumRed,
+                  width: 2,
                 ),
-                child: Text(
-                  _isSelling ? 'Make Offer' : 'Message',
-                  style: const TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 13,
-                  ),
+                shape: BoxShape.circle,
+              ),
+              child: IconButton(
+                icon: Icon(
+                  Icons.chat_bubble_outline_rounded,
+                  color: isSold ? Colors.grey : kPremiumRed,
                 ),
+                onPressed: (_isStartingChat || isSold) ? null : _startChat,
               ),
             ),
             const SizedBox(width: 12),
-            Expanded(
-              flex: 2,
-              child: ElevatedButton(
-                onPressed:
-                    _isStartingChat
-                        ? null
-                        : (_isRenting ? _handleRentRequest : _startChat),
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  backgroundColor: kPremiumRed,
-                  foregroundColor: Colors.white,
-                  elevation: 5,
-                  shadowColor: kPremiumRed.withOpacity(0.4),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
+
+            // --- DYNAMIC ACTION BUTTONS ---
+            if (_isSelling && _isRenting) ...[
+              Expanded(
+                child: OutlinedButton(
+                  onPressed:
+                      (_isStartingChat || isSold) ? null : _showOfferDialog,
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    side: BorderSide(
+                      color: isSold ? Colors.grey.shade300 : kPremiumRed,
+                      width: 2,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    foregroundColor: isSold ? Colors.grey : kPremiumRed,
+                  ),
+                  child: const Text(
+                    'Offer',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
                   ),
                 ),
-                child:
-                    _isStartingChat
-                        ? const SizedBox(
-                          height: 20,
-                          width: 20,
-                          child: CircularProgressIndicator(
-                            color: Colors.white,
-                            strokeWidth: 2,
-                          ),
-                        )
-                        : Text(
-                          _isRenting ? 'Select Dates' : 'Message Seller',
-                          style: const TextStyle(fontWeight: FontWeight.bold),
-                        ),
               ),
-            ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ElevatedButton(
+                  onPressed:
+                      (_isStartingChat || isSold) ? null : _handleRentRequest,
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    backgroundColor:
+                        isSold ? Colors.grey.shade300 : kPremiumRed,
+                    foregroundColor: isSold ? Colors.grey : Colors.white,
+                    elevation: isSold ? 0 : 5,
+                    shadowColor: kPremiumRed.withOpacity(0.4),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
+                  child: const Text(
+                    'Rent',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                  ),
+                ),
+              ),
+            ] else ...[
+              Expanded(
+                child: ElevatedButton(
+                  onPressed:
+                      (_isStartingChat || isSold)
+                          ? null
+                          : (_isRenting
+                              ? _handleRentRequest
+                              : _showOfferDialog),
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    backgroundColor:
+                        isSold ? Colors.grey.shade300 : kPremiumRed,
+                    foregroundColor: isSold ? Colors.grey : Colors.white,
+                    elevation: isSold ? 0 : 5,
+                    shadowColor: kPremiumRed.withOpacity(0.4),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
+                  child:
+                      _isStartingChat
+                          ? const SizedBox(
+                            height: 20,
+                            width: 20,
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 2,
+                            ),
+                          )
+                          : Text(
+                            _isRenting
+                                ? 'Select Dates to Rent'
+                                : 'Make an Offer',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 15,
+                            ),
+                          ),
+                ),
+              ),
+            ],
           ],
         ],
       ),

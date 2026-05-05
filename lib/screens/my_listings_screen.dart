@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:intl/intl.dart';
 import 'item_details_screen.dart';
 import 'edit_listing_screen.dart';
 
@@ -20,31 +21,72 @@ class MyListingsScreen extends StatefulWidget {
 class _MyListingsScreenState extends State<MyListingsScreen> {
   bool _isLoading = true;
   List<Map<String, dynamic>> _myListings = [];
-  String _currentFilter = 'All'; // 'All', 'Active', 'Sold'
+  List<Map<String, dynamic>> _myReviews = [];
+  double _rentalEarnings = 0.0; // NEW: Track rental earnings
+  String _currentFilter = 'All'; // 'All', 'Active', 'Sold', 'Reviews'
 
   @override
   void initState() {
     super.initState();
-    _fetchMyListings();
+    _fetchStoreData();
   }
 
-  Future<void> _fetchMyListings() async {
+  Future<void> _fetchStoreData() async {
     try {
       final user = Supabase.instance.client.auth.currentUser!;
-      final listingsData = await Supabase.instance.client
+
+      // 1. Fetch Listings
+      final listingsFuture = Supabase.instance.client
           .from('listings')
           .select('*')
           .eq('seller_id', user.id)
           .order('created_at', ascending: false);
 
+      // 2. Fetch Reviews
+      final reviewsFuture = Supabase.instance.client
+          .from('reviews')
+          .select('''
+            id,
+            rating,
+            comment,
+            created_at,
+            buyer:profiles!buyer_id(full_name),
+            listings(title, image_url)
+          ''')
+          .eq('seller_id', user.id)
+          .order('created_at', ascending: false);
+
+      // 3. NEW: Fetch paid Rentals to add to total earnings
+      final rentalsFuture = Supabase.instance.client
+          .from('rentals')
+          .select('total_rental_cost')
+          .eq('owner_id', user.id)
+          .eq('payment_status', 'paid');
+
+      final results = await Future.wait([
+        listingsFuture,
+        reviewsFuture,
+        rentalsFuture,
+      ]);
+
       if (mounted) {
         setState(() {
-          _myListings = List<Map<String, dynamic>>.from(listingsData);
+          _myListings = List<Map<String, dynamic>>.from(results[0]);
+          _myReviews = List<Map<String, dynamic>>.from(results[1]);
+
+          // Calculate rental earnings (Only the rental cost, excluding the deposit)
+          final rentals = List<Map<String, dynamic>>.from(results[2]);
+          _rentalEarnings = rentals.fold(
+            0.0,
+            (sum, r) => sum + (r['total_rental_cost'] as num).toDouble(),
+          );
+
           _isLoading = false;
         });
       }
     } catch (e) {
       if (mounted) setState(() => _isLoading = false);
+      debugPrint('Error fetching store data: $e');
     }
   }
 
@@ -52,9 +94,14 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
   int get _activeCount =>
       _myListings.where((i) => !(i['is_sold'] ?? false)).length;
   int get _soldCount => _myListings.where((i) => i['is_sold'] == true).length;
-  double get _totalEarnings => _myListings
-      .where((i) => i['is_sold'] == true)
-      .fold(0.0, (sum, item) => sum + (item['price'] as num).toDouble());
+
+  // NEW: Combine sale earnings + rental earnings
+  double get _totalEarnings {
+    final saleEarnings = _myListings
+        .where((i) => i['is_sold'] == true)
+        .fold(0.0, (sum, item) => sum + (item['price'] as num).toDouble());
+    return saleEarnings + _rentalEarnings;
+  }
 
   List<Map<String, dynamic>> get _filteredListings {
     if (_currentFilter == 'Active') {
@@ -65,16 +112,109 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
     return _myListings;
   }
 
-  // --- SOLD STATUS LOGIC ---
-  Future<void> _toggleSoldStatus(dynamic itemId, bool currentStatus) async {
-    if (currentStatus == true) {
-      await _updateListingInDatabase(itemId, false, null);
-      return;
-    }
-    _showBuyerSelectionSheet(itemId);
+  String _formatDate(String? isoString) {
+    if (isoString == null) return '';
+    final date = DateTime.parse(isoString).toLocal();
+    return DateFormat('MMM d, yyyy').format(date);
   }
 
-  void _showBuyerSelectionSheet(dynamic itemId) async {
+  // --- SOLD STATUS LOGIC ---
+  Future<void> _toggleSoldStatus(
+    Map<String, dynamic> item,
+    bool currentStatus,
+  ) async {
+    if (currentStatus == true) {
+      await _updateListingInDatabase(item['id'], false, null, null);
+      return;
+    }
+    _showBuyerSelectionSheet(item);
+  }
+
+  void _showFinalPriceDialog(Map<String, dynamic> item, String? buyerId) {
+    final TextEditingController priceController = TextEditingController(
+      text: item['price'].toString(),
+    );
+
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
+          title: const Text(
+            'Final Sale Price',
+            style: TextStyle(fontWeight: FontWeight.bold, color: kTextPrimary),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Enter the final agreed amount to keep your store earnings accurate.',
+                style: TextStyle(color: kTextSecondary, fontSize: 14),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: priceController,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                style: const TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: kTextPrimary,
+                ),
+                decoration: InputDecoration(
+                  prefixText: 'AED ',
+                  prefixStyle: const TextStyle(
+                    color: kTextSecondary,
+                    fontSize: 20,
+                  ),
+                  filled: true,
+                  fillColor: kBackground,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(16),
+                    borderSide: BorderSide.none,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(
+                'Cancel',
+                style: TextStyle(color: kTextSecondary),
+              ),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.green,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              onPressed: () {
+                final priceStr = priceController.text.trim();
+                final double? finalPrice = double.tryParse(priceStr);
+                Navigator.pop(ctx);
+                _updateListingInDatabase(item['id'], true, buyerId, finalPrice);
+              },
+              child: const Text(
+                'Confirm',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _showBuyerSelectionSheet(Map<String, dynamic> item) async {
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.white,
@@ -82,12 +222,11 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
       builder: (sheetContext) {
-        // <-- Use sheetContext here
         return FutureBuilder(
           future: Supabase.instance.client
               .from('chats')
               .select('buyer_id, profiles!chats_buyer_id_fkey(full_name)')
-              .eq('listing_id', itemId),
+              .eq('listing_id', item['id']),
           builder: (context, AsyncSnapshot<List<dynamic>> snapshot) {
             if (snapshot.connectionState == ConnectionState.waiting) {
               return const SizedBox(
@@ -110,7 +249,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                     'Mark as Sold',
                     style: TextStyle(
                       fontSize: 20,
-                      fontWeight: FontWeight.w800,
+                      fontWeight: FontWeight.bold,
                       color: kTextPrimary,
                     ),
                   ),
@@ -173,13 +312,9 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                               Icons.check_circle_outline,
                               color: Colors.grey,
                             ),
-                            onTap: () async {
+                            onTap: () {
                               Navigator.pop(sheetContext);
-                              await _updateListingInDatabase(
-                                itemId,
-                                true,
-                                buyerId,
-                              );
+                              _showFinalPriceDialog(item, buyerId);
                             },
                           );
                         },
@@ -189,9 +324,9 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                   SizedBox(
                     width: double.infinity,
                     child: OutlinedButton(
-                      onPressed: () async {
+                      onPressed: () {
                         Navigator.pop(sheetContext);
-                        await _updateListingInDatabase(itemId, true, null);
+                        _showFinalPriceDialog(item, null);
                       },
                       style: OutlinedButton.styleFrom(
                         padding: const EdgeInsets.symmetric(vertical: 16),
@@ -204,7 +339,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                         'Sold externally / Skip',
                         style: TextStyle(
                           color: kTextPrimary,
-                          fontWeight: FontWeight.w600,
+                          fontWeight: FontWeight.bold,
                         ),
                       ),
                     ),
@@ -222,14 +357,22 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
     dynamic itemId,
     bool isSold,
     String? buyerId,
+    double? finalPrice,
   ) async {
     try {
-      // .select() forces Supabase to return the updated row.
-      // If RLS blocks it, the response will be empty.
+      final updateData = <String, dynamic>{
+        'is_sold': isSold,
+        'buyer_id': buyerId,
+      };
+
+      if (isSold && finalPrice != null) {
+        updateData['price'] = finalPrice;
+      }
+
       final response =
           await Supabase.instance.client
               .from('listings')
-              .update({'is_sold': isSold, 'buyer_id': buyerId})
+              .update(updateData)
               .eq('id', itemId)
               .select();
 
@@ -255,7 +398,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
         return;
       }
 
-      await _fetchMyListings();
+      await _fetchStoreData();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -309,7 +452,6 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
     if (confirm != true) return;
 
     try {
-      // .select() forces Supabase to return the deleted row.
       final response =
           await Supabase.instance.client
               .from('listings')
@@ -339,7 +481,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
         return;
       }
 
-      await _fetchMyListings();
+      await _fetchStoreData();
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -360,9 +502,6 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
     Share.share('Check out my item on Avory: $title for AED $price!');
   }
 
-  // ============================================================================
-  // PROFESSIONAL OPTIONS MENU
-  // ============================================================================
   void _showManageOptions(Map<String, dynamic> item) {
     final bool isSold = item['is_sold'] ?? false;
 
@@ -377,7 +516,6 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Small handle indicator
               Container(
                 margin: const EdgeInsets.only(top: 12, bottom: 8),
                 height: 4,
@@ -387,7 +525,6 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                   borderRadius: BorderRadius.circular(2),
                 ),
               ),
-              // Context Header
               Padding(
                 padding: const EdgeInsets.symmetric(
                   horizontal: 20,
@@ -422,7 +559,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                             'AED ${item['price']}',
                             style: const TextStyle(
                               color: kTextSecondary,
-                              fontWeight: FontWeight.w600,
+                              fontWeight: FontWeight.bold,
                             ),
                           ),
                         ],
@@ -432,8 +569,6 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                 ),
               ),
               const Divider(height: 1),
-
-              // Menu Options
               ListTile(
                 leading: const Icon(
                   Icons.ios_share_rounded,
@@ -441,7 +576,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                 ),
                 title: const Text(
                   'Share Listing',
-                  style: TextStyle(fontWeight: FontWeight.w600),
+                  style: TextStyle(fontWeight: FontWeight.bold),
                 ),
                 onTap: () {
                   Navigator.pop(sheetContext);
@@ -456,21 +591,18 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                   ),
                   title: const Text(
                     'Edit Details',
-                    style: TextStyle(fontWeight: FontWeight.w600),
+                    style: TextStyle(fontWeight: FontWeight.bold),
                   ),
                   onTap: () async {
-                    Navigator.pop(sheetContext); // Pop the sheet first
-
-                    // Use the outer context to push the screen
+                    Navigator.pop(sheetContext);
                     final updated = await Navigator.push(
                       context,
                       MaterialPageRoute(
                         builder: (context) => EditListingScreen(item: item),
                       ),
                     );
-
                     if (updated == true) {
-                      await _fetchMyListings(); // Ensure we wait for fetch
+                      await _fetchStoreData();
                     }
                   },
                 ),
@@ -484,14 +616,14 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                 title: Text(
                   isSold ? 'Mark as Available' : 'Mark as Sold',
                   style: TextStyle(
-                    fontWeight: FontWeight.w600,
+                    fontWeight: FontWeight.bold,
                     color:
                         isSold ? Colors.orange.shade800 : Colors.green.shade700,
                   ),
                 ),
                 onTap: () async {
                   Navigator.pop(sheetContext);
-                  await _toggleSoldStatus(item['id'], isSold);
+                  await _toggleSoldStatus(item, isSold);
                 },
               ),
               const Divider(height: 1),
@@ -503,7 +635,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                 title: const Text(
                   'Delete Listing',
                   style: TextStyle(
-                    fontWeight: FontWeight.w600,
+                    fontWeight: FontWeight.bold,
                     color: Colors.red,
                   ),
                 ),
@@ -520,8 +652,6 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
     );
   }
 
-  // --- UI BUILD ---
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -529,7 +659,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
       appBar: AppBar(
         title: const Text(
           'My Store',
-          style: TextStyle(fontWeight: FontWeight.w800, color: kTextPrimary),
+          style: TextStyle(fontWeight: FontWeight.bold, color: kTextPrimary),
         ),
         backgroundColor: Colors.white,
         elevation: 0,
@@ -542,7 +672,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
               )
               : RefreshIndicator(
                 color: kPremiumRed,
-                onRefresh: _fetchMyListings,
+                onRefresh: _fetchStoreData,
                 child: CustomScrollView(
                   physics: const AlwaysScrollableScrollPhysics(),
                   slivers: [
@@ -550,76 +680,103 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          // 1. STATS BANNER
                           _buildStatsHeader(),
-
-                          // 2. INTERACTIVE FILTER TABS
                           _buildFilterTabs(),
                           const SizedBox(height: 8),
                         ],
                       ),
                     ),
 
-                    // 3. THE GRID
-                    if (_filteredListings.isEmpty)
-                      SliverFillRemaining(
-                        child: Center(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(
-                                Icons.dashboard_customize_outlined,
-                                size: 64,
-                                color: Colors.grey.shade300,
-                              ),
-                              const SizedBox(height: 16),
-                              Text(
-                                _myListings.isEmpty
-                                    ? "You haven't posted any items yet."
-                                    : "No items match this filter.",
-                                style: const TextStyle(
-                                  color: kTextSecondary,
-                                  fontSize: 16,
+                    if (_currentFilter == 'Reviews') ...[
+                      if (_myReviews.isEmpty)
+                        SliverFillRemaining(
+                          child: Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  Icons.star_outline_rounded,
+                                  size: 64,
+                                  color: Colors.grey.shade300,
                                 ),
-                              ),
-                            ],
+                                const SizedBox(height: 16),
+                                const Text(
+                                  "No reviews yet.",
+                                  style: TextStyle(
+                                    color: kTextSecondary,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
-                        ),
-                      )
-                    else
-                      SliverPadding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 8,
-                        ),
-                        sliver: SliverGrid(
-                          gridDelegate:
-                              const SliverGridDelegateWithFixedCrossAxisCount(
-                                crossAxisCount: 2,
-                                crossAxisSpacing: 16,
-                                mainAxisSpacing: 16,
-                                childAspectRatio: 0.68,
-                              ),
+                        )
+                      else
+                        SliverList(
                           delegate: SliverChildBuilderDelegate((
                             context,
                             index,
                           ) {
-                            return _buildSellerListingCard(
-                              _filteredListings[index],
-                            );
-                          }, childCount: _filteredListings.length),
+                            return _buildReviewCard(_myReviews[index]);
+                          }, childCount: _myReviews.length),
                         ),
-                      ),
-
-                    // Padding at bottom
+                    ] else ...[
+                      if (_filteredListings.isEmpty)
+                        SliverFillRemaining(
+                          child: Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  Icons.dashboard_customize_outlined,
+                                  size: 64,
+                                  color: Colors.grey.shade300,
+                                ),
+                                const SizedBox(height: 16),
+                                Text(
+                                  _myListings.isEmpty
+                                      ? "You haven't posted any items yet."
+                                      : "No items match this filter.",
+                                  style: const TextStyle(
+                                    color: kTextSecondary,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        )
+                      else
+                        SliverPadding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 8,
+                          ),
+                          sliver: SliverGrid(
+                            gridDelegate:
+                                const SliverGridDelegateWithFixedCrossAxisCount(
+                                  crossAxisCount: 2,
+                                  crossAxisSpacing: 16,
+                                  mainAxisSpacing: 16,
+                                  childAspectRatio: 0.68,
+                                ),
+                            delegate: SliverChildBuilderDelegate((
+                              context,
+                              index,
+                            ) {
+                              return _buildSellerListingCard(
+                                _filteredListings[index],
+                              );
+                            }, childCount: _filteredListings.length),
+                          ),
+                        ),
+                    ],
                     const SliverToBoxAdapter(child: SizedBox(height: 40)),
                   ],
                 ),
               ),
     );
   }
-
-  // --- COMPONENT WIDGETS ---
 
   Widget _buildStatsHeader() {
     return Container(
@@ -664,7 +821,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
           style: const TextStyle(
             color: Colors.white,
             fontSize: 20,
-            fontWeight: FontWeight.w900,
+            fontWeight: FontWeight.bold,
           ),
         ),
         const SizedBox(height: 4),
@@ -674,7 +831,6 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
             color: Colors.white.withOpacity(0.7),
             fontSize: 10,
             fontWeight: FontWeight.bold,
-            letterSpacing: 1.0,
           ),
         ),
       ],
@@ -682,40 +838,184 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
   }
 
   Widget _buildFilterTabs() {
+    final filters = ['All', 'Active', 'Sold', 'Reviews'];
+
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16.0),
-      child: Row(
-        children:
-            ['All', 'Active', 'Sold'].map((filter) {
-              final isSelected = _currentFilter == filter;
-              return Padding(
-                padding: const EdgeInsets.only(right: 8.0),
-                child: ChoiceChip(
-                  label: Text(
-                    filter,
-                    style: TextStyle(
-                      color: isSelected ? Colors.white : kTextPrimary,
-                      fontWeight:
-                          isSelected ? FontWeight.bold : FontWeight.w500,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        physics: const BouncingScrollPhysics(),
+        child: Row(
+          children:
+              filters.map((filter) {
+                final isSelected = _currentFilter == filter;
+                return Padding(
+                  padding: const EdgeInsets.only(right: 8.0),
+                  child: ChoiceChip(
+                    label: Text(
+                      filter,
+                      style: TextStyle(
+                        color: isSelected ? Colors.white : kTextPrimary,
+                        fontWeight:
+                            isSelected ? FontWeight.bold : FontWeight.normal,
+                      ),
                     ),
-                  ),
-                  selected: isSelected,
-                  selectedColor: kPremiumRed,
-                  backgroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(20),
-                    side: BorderSide(
-                      color: isSelected ? kPremiumRed : Colors.grey.shade300,
+                    selected: isSelected,
+                    selectedColor: kPremiumRed,
+                    backgroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(20),
+                      side: BorderSide(
+                        color: isSelected ? kPremiumRed : Colors.grey.shade300,
+                      ),
                     ),
+                    onSelected: (selected) {
+                      if (selected) {
+                        setState(() => _currentFilter = filter);
+                      }
+                    },
                   ),
-                  onSelected: (selected) {
-                    if (selected) {
-                      setState(() => _currentFilter = filter);
-                    }
-                  },
+                );
+              }).toList(),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildReviewCard(Map<String, dynamic> review) {
+    final buyerName = review['buyer']['full_name'] ?? 'Unknown User';
+    final initial = buyerName.isNotEmpty ? buyerName[0].toUpperCase() : '?';
+    final rating = review['rating'] as int? ?? 5;
+    final comment = review['comment'] ?? '';
+    final dateString = _formatDate(review['created_at']);
+    final itemTitle = review['listings']?['title'] ?? 'Unknown Item';
+    final itemImage = review['listings']?['image_url'];
+
+    return Container(
+      margin: const EdgeInsets.only(left: 16, right: 16, bottom: 16),
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: kSurface,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: Colors.black.withOpacity(0.04), width: 1.5),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.02),
+            blurRadius: 15,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              CircleAvatar(
+                backgroundColor: kPremiumRed.withOpacity(0.1),
+                child: Text(
+                  initial,
+                  style: const TextStyle(
+                    color: kPremiumRed,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
-              );
-            }).toList(),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      buyerName,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                      ),
+                    ),
+                    Row(
+                      children: List.generate(5, (index) {
+                        return Icon(
+                          index < rating
+                              ? Icons.star_rounded
+                              : Icons.star_border_rounded,
+                          color: Colors.amber,
+                          size: 16,
+                        );
+                      }),
+                    ),
+                  ],
+                ),
+              ),
+              Text(
+                dateString,
+                style: const TextStyle(color: kTextSecondary, fontSize: 12),
+              ),
+            ],
+          ),
+          if (comment.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Text(comment, style: const TextStyle(fontSize: 15, height: 1.4)),
+          ],
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: kBackground,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Row(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child:
+                      itemImage != null
+                          ? Image.network(
+                            itemImage,
+                            width: 40,
+                            height: 40,
+                            fit: BoxFit.cover,
+                          )
+                          : Container(
+                            width: 40,
+                            height: 40,
+                            color: Colors.grey.shade300,
+                            child: const Icon(
+                              Icons.image,
+                              size: 20,
+                              color: Colors.grey,
+                            ),
+                          ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Item Sold',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: kTextSecondary,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      Text(
+                        itemTitle,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -747,7 +1047,6 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // IMAGE SECTION
             Expanded(
               child: Stack(
                 fit: StackFit.expand,
@@ -795,14 +1094,11 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                           style: TextStyle(
                             color: Colors.white,
                             fontSize: 20,
-                            fontWeight: FontWeight.w900,
-                            letterSpacing: 2,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
                       ),
                     ),
-
-                  // THE CLEAN "OPTIONS" MENU ICON
                   Positioned(
                     top: 8,
                     right: 8,
@@ -832,8 +1128,6 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                 ],
               ),
             ),
-
-            // DETAILS SECTION
             Padding(
               padding: const EdgeInsets.all(12.0),
               child: Column(
@@ -844,7 +1138,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                      fontWeight: FontWeight.w600,
+                      fontWeight: FontWeight.bold,
                       fontSize: 14,
                       color: isSold ? Colors.grey : kTextPrimary,
                       decoration: isSold ? TextDecoration.lineThrough : null,
@@ -855,7 +1149,7 @@ class _MyListingsScreenState extends State<MyListingsScreen> {
                     'AED ${item['price']}',
                     style: TextStyle(
                       color: isSold ? Colors.grey : kPremiumRed,
-                      fontWeight: FontWeight.w800,
+                      fontWeight: FontWeight.bold,
                       fontSize: 15,
                     ),
                   ),
