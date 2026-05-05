@@ -6,9 +6,20 @@ class AuthService {
 
   /// Opens the secure Google Login browser
   Future<void> signInWithGoogle() async {
+    // 1. Determine exactly where we are right now
+    String? webRedirectUrl;
+    if (kIsWeb) {
+      // If we are testing on our computer, go to localhost.
+      // Otherwise, go to the live GitHub site!
+      webRedirectUrl =
+          kDebugMode
+              ? 'http://localhost:3000'
+              : 'https://OfficialAvory.github.io/UniTrade/';
+    }
+
     await _supabase.auth.signInWithOAuth(
       OAuthProvider.google,
-      redirectTo: kIsWeb ? null : 'avory://login-callback',
+      redirectTo: kIsWeb ? webRedirectUrl : 'avory://login-callback',
     );
   }
 
