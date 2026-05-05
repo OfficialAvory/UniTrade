@@ -1,7 +1,7 @@
 import 'dart:convert';
-import 'dart:io';
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'; // NEW: Required for kIsWeb
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:intl/intl.dart';
 import 'package:http/http.dart' as http;
@@ -198,14 +198,15 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() => _isProcessingAction = true);
 
     try {
-      final file = File(image.path);
-      final fileExt = image.path.split('.').last;
+      // Use readAsBytes instead of File to support Web platform safely
+      final imageBytes = await image.readAsBytes();
+      final fileExt = image.name.split('.').last;
       final fileName = '${DateTime.now().millisecondsSinceEpoch}.$fileExt';
       final filePath = '${widget.chatId}/$fileName';
 
       await Supabase.instance.client.storage
           .from('chat_images')
-          .upload(filePath, file);
+          .uploadBinary(filePath, imageBytes);
 
       final imageUrl = Supabase.instance.client.storage
           .from('chat_images')
@@ -760,8 +761,22 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  // --- RESTORED ORIGINAL STRIPE LOGIC ---
+  // =====================================================================
+  // STRIPE DIRECT API CALLS (TEST MODE ONLY)
+  // =====================================================================
+
   Future<void> _payWithStripe(String amountString) async {
+    // 1. Prevent Web Crash
+    if (kIsWeb) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('💳 Please use the mobile app to process payments!'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
     if (_isProcessingAction) return;
     setState(() => _isProcessingAction = true);
 
@@ -780,6 +795,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
       final int amountInFils = (double.parse(amountString) * 100).toInt();
 
+      // 2. Direct call to Stripe API
       final response = await http.post(
         Uri.parse('https://api.stripe.com/v1/payment_intents'),
         headers: {
@@ -859,8 +875,20 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _payForRental(Map<String, dynamic> rental) async {
+    // 1. Prevent Web Crash
+    if (kIsWeb) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('💳 Please use the mobile app to process payments!'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
     if (_isProcessingAction) return;
     setState(() => _isProcessingAction = true);
+
     try {
       showDialog(
         context: context,
@@ -873,10 +901,12 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ),
       );
+
       final double rentCost = (rental['total_rental_cost'] as num).toDouble();
       final double deposit = (rental['security_deposit'] as num).toDouble();
       final int amountInFils = ((rentCost + deposit) * 100).toInt();
 
+      // 2. Direct call to Stripe API
       final response = await http.post(
         Uri.parse('https://api.stripe.com/v1/payment_intents'),
         headers: {
@@ -885,12 +915,14 @@ class _ChatScreenState extends State<ChatScreen> {
         },
         body: {'amount': amountInFils.toString(), 'currency': 'aed'},
       );
+
       final paymentIntent = jsonDecode(response.body);
+
       if (paymentIntent['error'] != null) {
         throw Exception(paymentIntent['error']['message']);
       }
-      final String paymentIntentId =
-          paymentIntent['id'] ?? paymentIntent['paymentIntentId'];
+
+      final String paymentIntentId = paymentIntent['id'];
 
       await Stripe.instance.initPaymentSheet(
         paymentSheetParameters: SetupPaymentSheetParameters(
@@ -899,8 +931,11 @@ class _ChatScreenState extends State<ChatScreen> {
           style: ThemeMode.system,
         ),
       );
+
       if (mounted) Navigator.pop(context);
+
       await Stripe.instance.presentPaymentSheet();
+
       await Supabase.instance.client
           .from('rentals')
           .update({
@@ -909,6 +944,7 @@ class _ChatScreenState extends State<ChatScreen> {
             'stripe_payment_intent_id': paymentIntentId,
           })
           .eq('id', rental['id']);
+
       await Supabase.instance.client.from('messages').insert({
         'chat_id': widget.chatId,
         'sender_id': _currentUserId,
@@ -1048,6 +1084,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _completeRentalAndRefund(Map<String, dynamic> rental) async {
     if (_isProcessingAction) return;
     setState(() => _isProcessingAction = true);
+
     try {
       showDialog(
         context: context,
@@ -1060,6 +1097,11 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ),
       );
+
+      final int refundAmount =
+          ((rental['security_deposit'] as num).toDouble() * 100).toInt();
+
+      // 1. Direct call to Stripe Refund API
       final response = await http.post(
         Uri.parse('https://api.stripe.com/v1/refunds'),
         headers: {
@@ -1068,14 +1110,12 @@ class _ChatScreenState extends State<ChatScreen> {
         },
         body: {
           'payment_intent': rental['stripe_payment_intent_id'],
-          'amount':
-              ((rental['security_deposit'] as num).toDouble() * 100)
-                  .toInt()
-                  .toString(),
+          'amount': refundAmount.toString(),
         },
       );
 
       final refundData = jsonDecode(response.body);
+
       if (refundData['error'] != null) {
         throw Exception(refundData['error']['message']);
       }
@@ -1084,11 +1124,13 @@ class _ChatScreenState extends State<ChatScreen> {
           .from('rentals')
           .update({'status': 'completed'})
           .eq('id', rental['id']);
+
       await Supabase.instance.client.from('messages').insert({
         'chat_id': widget.chatId,
         'sender_id': _currentUserId,
         'content': '✅ Item returned safely! Deposit released.',
       });
+
       if (mounted) {
         Navigator.pop(context);
         _showReviewModal(rental['renter_id'], rental['listing_id'], null);
@@ -2266,7 +2308,7 @@ class _ChatScreenState extends State<ChatScreen> {
                                     : Colors.grey.shade100,
                             child: const Center(
                               child: CircularProgressIndicator(
-                                color: Colors.white,
+                                color: kPremiumRed,
                               ),
                             ),
                           ),

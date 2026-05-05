@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'; // NEW: Required for kIsWeb
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:flutter_stripe/flutter_stripe.dart'; // NEW: Imported Stripe
+import 'package:flutter_stripe/flutter_stripe.dart';
 import 'screens/auth_gate.dart';
 
 Future<void> main() async {
@@ -12,8 +13,11 @@ Future<void> main() async {
   // Load environment variables
   await dotenv.load(fileName: ".env");
 
-  // NEW: Initialize Stripe with your Test Publishable Key from .env
-  Stripe.publishableKey = dotenv.env['STRIPE_PUBLISHABLE_KEY']!;
+  // NEW: Only initialize native Stripe if we are NOT on the web
+  if (!kIsWeb) {
+    Stripe.publishableKey = dotenv.env['STRIPE_PUBLISHABLE_KEY']!;
+    await Stripe.instance.applySettings();
+  }
 
   // Initialize Supabase client
   await Supabase.initialize(
