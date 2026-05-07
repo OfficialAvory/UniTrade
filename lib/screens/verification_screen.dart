@@ -1,6 +1,5 @@
-import 'dart:io';
-import 'dart:math' as math; // Added for floating animation
-import 'dart:ui'; // Added for ImageFilter (Glassmorphism)
+import 'dart:math' as math;
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
@@ -14,27 +13,35 @@ const Color kTextPrimary = Color(0xFF212121);
 const Color kTextSecondary = Color(0xFF757575);
 
 class VerificationScreen extends StatefulWidget {
-  const VerificationScreen({super.key});
+  // Accept the pending status from AuthGate
+  final bool isInitiallyPending;
+
+  const VerificationScreen({
+    super.key,
+    this.isInitiallyPending = false,
+  });
 
   @override
   State<VerificationScreen> createState() => _VerificationScreenState();
 }
 
-// CHANGED: From SingleTickerProviderStateMixin to TickerProviderStateMixin
-// because we now have multiple animation controllers.
 class _VerificationScreenState extends State<VerificationScreen>
     with TickerProviderStateMixin {
-  File? _selectedImage;
+  // FIXED: Use XFile instead of File (dart:io not supported on web)
+  XFile? _selectedImage;
   bool _isUploading = false;
-  bool _isSubmitted = false;
+  late bool _isSubmitted;
+
   final _supabase = Supabase.instance.client;
 
   late AnimationController _entranceController;
-  late AnimationController _floatingController; // Added for background blobs
+  late AnimationController _floatingController;
 
   @override
   void initState() {
     super.initState();
+
+    _isSubmitted = widget.isInitiallyPending;
 
     // Entrance Animation
     _entranceController = AnimationController(
@@ -71,7 +78,7 @@ class _VerificationScreenState extends State<VerificationScreen>
       opacity: animation,
       child: SlideTransition(
         position: Tween<Offset>(
-          begin: const Offset(0, 0.2), // Starts slightly lower
+          begin: const Offset(0, 0.2),
           end: Offset.zero,
         ).animate(animation),
         child: child,
@@ -89,7 +96,8 @@ class _VerificationScreenState extends State<VerificationScreen>
 
     if (pickedFile != null) {
       setState(() {
-        _selectedImage = File(pickedFile.path);
+        // FIXED: Store as XFile directly — no File() wrapper
+        _selectedImage = pickedFile;
       });
     }
   }
@@ -114,15 +122,26 @@ class _VerificationScreenState extends State<VerificationScreen>
       final timestamp = DateTime.now().millisecondsSinceEpoch;
       final filePath = '${user.id}/proof_$timestamp.jpg';
 
+      // FIXED: Read as bytes — works on ALL platforms (web, mobile, desktop)
+      final bytes = await _selectedImage!.readAsBytes();
+
+      // FIXED: Use uploadBinary with bytes instead of upload with File
       await _supabase.storage
           .from('verifications')
-          .upload(filePath, _selectedImage!);
+          .uploadBinary(filePath, bytes);
 
-      // Reset animation controller to replay for the success screen
+      // Upsert the Database Profile Table so Admin can see it
+      await _supabase.from('profiles').upsert({
+        'id': user.id,
+        'verification_document': filePath,
+        'is_verified': false,
+      });
+
+      // Reset animation controller and show success screen
       _entranceController.reset();
       setState(() => _isSubmitted = true);
       _entranceController.forward();
-      HapticFeedback.heavyImpact(); // Success feedback
+      HapticFeedback.heavyImpact();
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -156,43 +175,42 @@ class _VerificationScreenState extends State<VerificationScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: kBackground,
-      extendBodyBehindAppBar: true, // Let the background bleed under the AppBar
-      appBar:
-          _isSubmitted
-              ? null
-              : AppBar(
-                backgroundColor: Colors.transparent,
-                elevation: 0,
-                actions: [
-                  TextButton.icon(
-                    onPressed: _signOut,
-                    icon: const Icon(
-                      Icons.logout_rounded,
+      extendBodyBehindAppBar: true,
+      appBar: _isSubmitted
+          ? null
+          : AppBar(
+              backgroundColor: Colors.transparent,
+              elevation: 0,
+              actions: [
+                TextButton.icon(
+                  onPressed: _signOut,
+                  icon: const Icon(
+                    Icons.logout_rounded,
+                    color: kTextSecondary,
+                    size: 18,
+                  ),
+                  label: const Text(
+                    'Log Out',
+                    style: TextStyle(
                       color: kTextSecondary,
-                      size: 18,
-                    ),
-                    label: const Text(
-                      'Log Out',
-                      style: TextStyle(
-                        color: kTextSecondary,
-                        fontWeight: FontWeight.w600,
-                      ),
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
-                  const SizedBox(width: 8),
-                ],
-              ),
+                ),
+                const SizedBox(width: 8),
+              ],
+            ),
       body: Stack(
         children: [
-          // Animated Background Blob 1 (Top Right)
+          // Animated Background Blob 1
           AnimatedBuilder(
             animation: _floatingController,
             builder: (context, child) {
               return Positioned(
-                top:
-                    -100 + (math.sin(_floatingController.value * math.pi) * 20),
-                right:
-                    -100 + (math.cos(_floatingController.value * math.pi) * 10),
+                top: -100 +
+                    (math.sin(_floatingController.value * math.pi) * 20),
+                right: -100 +
+                    (math.cos(_floatingController.value * math.pi) * 10),
                 child: child!,
               );
             },
@@ -206,15 +224,15 @@ class _VerificationScreenState extends State<VerificationScreen>
             ),
           ),
 
-          // Animated Background Blob 2 (Bottom Left)
+          // Animated Background Blob 2
           AnimatedBuilder(
             animation: _floatingController,
             builder: (context, child) {
               return Positioned(
-                bottom:
-                    -50 + (math.cos(_floatingController.value * math.pi) * 20),
-                left:
-                    -100 + (math.sin(_floatingController.value * math.pi) * 15),
+                bottom: -50 +
+                    (math.cos(_floatingController.value * math.pi) * 20),
+                left: -100 +
+                    (math.sin(_floatingController.value * math.pi) * 15),
                 child: child!,
               );
             },
@@ -228,13 +246,13 @@ class _VerificationScreenState extends State<VerificationScreen>
             ),
           ),
 
-          // Glassmorphism effect over the blobs
+          // Glassmorphism effect
           BackdropFilter(
             filter: ImageFilter.blur(sigmaX: 60.0, sigmaY: 60.0),
             child: Container(color: Colors.transparent),
           ),
 
-          // Main Content
+          // Main Content changes based on the _isSubmitted flag
           _isSubmitted ? _buildSuccessView() : _buildUploadView(),
         ],
       ),
@@ -306,10 +324,9 @@ class _VerificationScreenState extends State<VerificationScreen>
             // Image Dropzone / Preview Area
             _buildAnimatedWidget(
               startDelay: 0.3,
-              child:
-                  _selectedImage != null
-                      ? _buildImagePreview()
-                      : _buildImageDropzone(),
+              child: _selectedImage != null
+                  ? _buildImagePreview()
+                  : _buildImageDropzone(),
             ),
 
             const SizedBox(height: 40),
@@ -320,10 +337,9 @@ class _VerificationScreenState extends State<VerificationScreen>
               child: SizedBox(
                 height: 60,
                 child: ElevatedButton(
-                  onPressed:
-                      (_selectedImage == null || _isUploading)
-                          ? null
-                          : _uploadDocument,
+                  onPressed: (_selectedImage == null || _isUploading)
+                      ? null
+                      : _uploadDocument,
                   style: ElevatedButton.styleFrom(
                     backgroundColor: kPremiumRed,
                     disabledBackgroundColor: kPremiumRed.withOpacity(0.3),
@@ -333,24 +349,23 @@ class _VerificationScreenState extends State<VerificationScreen>
                       borderRadius: BorderRadius.circular(16),
                     ),
                   ),
-                  child:
-                      _isUploading
-                          ? const SizedBox(
-                            height: 24,
-                            width: 24,
-                            child: CircularProgressIndicator(
-                              color: Colors.white,
-                              strokeWidth: 3,
-                            ),
-                          )
-                          : const Text(
-                            'Submit for Review',
-                            style: TextStyle(
-                              fontSize: 17,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 0.2,
-                            ),
+                  child: _isUploading
+                      ? const SizedBox(
+                          height: 24,
+                          width: 24,
+                          child: CircularProgressIndicator(
+                            color: Colors.white,
+                            strokeWidth: 3,
                           ),
+                        )
+                      : const Text(
+                          'Submit for Review',
+                          style: TextStyle(
+                            fontSize: 17,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 0.2,
+                          ),
+                        ),
                 ),
               ),
             ),
@@ -414,7 +429,7 @@ class _VerificationScreenState extends State<VerificationScreen>
     );
   }
 
-  // The state showing the picked image, with a remove button
+  // FIXED: Use Image.network with XFile.path — works cross-platform
   Widget _buildImagePreview() {
     return Container(
       height: 220,
@@ -434,9 +449,20 @@ class _VerificationScreenState extends State<VerificationScreen>
         children: [
           ClipRRect(
             borderRadius: BorderRadius.circular(20),
-            child: Image.file(_selectedImage!, fit: BoxFit.cover),
+            // FIXED: Image.network works on web; XFile.path is a blob URL on web
+            child: Image.network(
+              _selectedImage!.path,
+              fit: BoxFit.cover,
+              errorBuilder: (context, error, stackTrace) => Container(
+                color: kBackground,
+                child: const Center(
+                  child: Icon(Icons.image_rounded,
+                      size: 48, color: kTextSecondary),
+                ),
+              ),
+            ),
           ),
-          // Dark gradient overlay to make the change button pop
+          // Dark gradient overlay
           Container(
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(20),
@@ -451,7 +477,7 @@ class _VerificationScreenState extends State<VerificationScreen>
               ),
             ),
           ),
-          // Change/Remove Button
+          // Remove Button
           Positioned(
             top: 12,
             right: 12,
@@ -466,7 +492,8 @@ class _VerificationScreenState extends State<VerificationScreen>
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.close_rounded, size: 16, color: kTextPrimary),
+                      Icon(Icons.close_rounded,
+                          size: 16, color: kTextPrimary),
                       SizedBox(width: 6),
                       Text(
                         'Remove',
