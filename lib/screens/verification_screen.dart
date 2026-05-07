@@ -13,7 +13,6 @@ const Color kTextPrimary = Color(0xFF212121);
 const Color kTextSecondary = Color(0xFF757575);
 
 class VerificationScreen extends StatefulWidget {
-  // Accept the pending status from AuthGate
   final bool isInitiallyPending;
 
   const VerificationScreen({
@@ -27,7 +26,6 @@ class VerificationScreen extends StatefulWidget {
 
 class _VerificationScreenState extends State<VerificationScreen>
     with TickerProviderStateMixin {
-  // FIXED: Use XFile instead of File (dart:io not supported on web)
   XFile? _selectedImage;
   bool _isUploading = false;
   late bool _isSubmitted;
@@ -43,14 +41,12 @@ class _VerificationScreenState extends State<VerificationScreen>
 
     _isSubmitted = widget.isInitiallyPending;
 
-    // Entrance Animation
     _entranceController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1000),
     );
     _entranceController.forward();
 
-    // Background Floating Animation
     _floatingController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 4),
@@ -64,7 +60,6 @@ class _VerificationScreenState extends State<VerificationScreen>
     super.dispose();
   }
 
-  // Helper for staggered slide-up animations
   Widget _buildAnimatedWidget({
     required Widget child,
     required double startDelay,
@@ -96,7 +91,6 @@ class _VerificationScreenState extends State<VerificationScreen>
 
     if (pickedFile != null) {
       setState(() {
-        // FIXED: Store as XFile directly — no File() wrapper
         _selectedImage = pickedFile;
       });
     }
@@ -122,22 +116,26 @@ class _VerificationScreenState extends State<VerificationScreen>
       final timestamp = DateTime.now().millisecondsSinceEpoch;
       final filePath = '${user.id}/proof_$timestamp.jpg';
 
-      // FIXED: Read as bytes — works on ALL platforms (web, mobile, desktop)
       final bytes = await _selectedImage!.readAsBytes();
 
-      // FIXED: Use uploadBinary with bytes instead of upload with File
+      // FIX: Explicitly provide contentType to avoid dart:io MIME sniffing
       await _supabase.storage
           .from('verifications')
-          .uploadBinary(filePath, bytes);
+          .uploadBinary(
+            filePath,
+            bytes,
+            fileOptions: const FileOptions(
+              contentType: 'image/jpeg',
+              upsert: false,
+            ),
+          );
 
-      // Upsert the Database Profile Table so Admin can see it
       await _supabase.from('profiles').upsert({
         'id': user.id,
         'verification_document': filePath,
         'is_verified': false,
       });
 
-      // Reset animation controller and show success screen
       _entranceController.reset();
       setState(() => _isSubmitted = true);
       _entranceController.forward();
@@ -252,7 +250,6 @@ class _VerificationScreenState extends State<VerificationScreen>
             child: Container(color: Colors.transparent),
           ),
 
-          // Main Content changes based on the _isSubmitted flag
           _isSubmitted ? _buildSuccessView() : _buildUploadView(),
         ],
       ),
@@ -272,7 +269,6 @@ class _VerificationScreenState extends State<VerificationScreen>
           children: [
             SizedBox(height: size.height * 0.02),
 
-            // Icon Header
             _buildAnimatedWidget(
               startDelay: 0.0,
               child: Center(
@@ -292,7 +288,6 @@ class _VerificationScreenState extends State<VerificationScreen>
             ),
             const SizedBox(height: 24),
 
-            // Typography
             _buildAnimatedWidget(
               startDelay: 0.1,
               child: const Text(
@@ -321,7 +316,6 @@ class _VerificationScreenState extends State<VerificationScreen>
             ),
             const SizedBox(height: 40),
 
-            // Image Dropzone / Preview Area
             _buildAnimatedWidget(
               startDelay: 0.3,
               child: _selectedImage != null
@@ -331,7 +325,6 @@ class _VerificationScreenState extends State<VerificationScreen>
 
             const SizedBox(height: 40),
 
-            // Submit Button
             _buildAnimatedWidget(
               startDelay: 0.4,
               child: SizedBox(
@@ -376,7 +369,6 @@ class _VerificationScreenState extends State<VerificationScreen>
     );
   }
 
-  // The empty state where the user taps to pick an image
   Widget _buildImageDropzone() {
     return GestureDetector(
       onTap: _pickImage,
@@ -429,7 +421,6 @@ class _VerificationScreenState extends State<VerificationScreen>
     );
   }
 
-  // FIXED: Use Image.network with XFile.path — works cross-platform
   Widget _buildImagePreview() {
     return Container(
       height: 220,
@@ -449,7 +440,6 @@ class _VerificationScreenState extends State<VerificationScreen>
         children: [
           ClipRRect(
             borderRadius: BorderRadius.circular(20),
-            // FIXED: Image.network works on web; XFile.path is a blob URL on web
             child: Image.network(
               _selectedImage!.path,
               fit: BoxFit.cover,
@@ -462,7 +452,6 @@ class _VerificationScreenState extends State<VerificationScreen>
               ),
             ),
           ),
-          // Dark gradient overlay
           Container(
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(20),
@@ -477,7 +466,6 @@ class _VerificationScreenState extends State<VerificationScreen>
               ),
             ),
           ),
-          // Remove Button
           Positioned(
             top: 12,
             right: 12,
@@ -492,8 +480,7 @@ class _VerificationScreenState extends State<VerificationScreen>
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.close_rounded,
-                          size: 16, color: kTextPrimary),
+                      Icon(Icons.close_rounded, size: 16, color: kTextPrimary),
                       SizedBox(width: 6),
                       Text(
                         'Remove',
